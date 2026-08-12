@@ -67,6 +67,19 @@ def test_scan_enqueues_and_moves_audio_out_of_inbox(cfg, make_wav, make_sidecar)
     assert not (cfg.paths.inbox / "a.json").exists()
 
 
+def test_bom_encoded_sidecar_is_accepted(cfg, make_wav, make_sidecar) -> None:
+    """A recorder written in PowerShell or .NET emits BOM'd JSON by default."""
+    make_wav(cfg.paths.inbox / "a.wav")
+    sidecar = make_sidecar(cfg.paths.inbox / "a.json", call_id="bom")
+    sidecar.write_bytes(b"\xef\xbb\xbf" + sidecar.read_bytes())
+    store = _store(cfg)
+
+    result = scan_once(cfg, store)
+
+    assert result.enqueued == ("bom",)
+    assert result.quarantined == ()
+
+
 def test_scan_dedups_repeated_call_id(cfg, make_wav, make_sidecar) -> None:
     store = _store(cfg)
     make_wav(cfg.paths.inbox / "a.wav")

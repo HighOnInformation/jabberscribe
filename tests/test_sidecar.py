@@ -97,6 +97,14 @@ def test_invalid_sidecars_are_rejected(mutation: dict, message: str) -> None:
         parse_sidecar(json.dumps(payload))
 
 
+def test_utf8_bom_is_tolerated() -> None:
+    """PowerShell, .NET, and Notepad all emit UTF-8 with a BOM by default."""
+    sc = parse_sidecar("﻿" + json.dumps(VALID))
+
+    assert sc.call_id == "8f2a1c4e"
+    assert not sc.raw.startswith("﻿")
+
+
 def test_malformed_json_is_rejected() -> None:
     with pytest.raises(SidecarError, match="JSON"):
         parse_sidecar("{not json")

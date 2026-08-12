@@ -10,7 +10,9 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+
+from jabberscribe.jobs import STAGE_ORDER
 
 
 class ConfigError(Exception):
@@ -48,10 +50,38 @@ class SttConfig(_Strict):
     vocabulary_file: Path | None = None
 
 
+class PipelineConfig(_Strict):
+    """Which stages this deployment runs, in order.
+
+    This is the activation switch for the whole system. The core stages ship
+    first; each outer stage becomes available by adding its name here once it
+    exists. `doctor` reports any stage that is enabled but not yet implemented,
+    so turning one on early tells you so instead of failing mid-call.
+    """
+
+    stages: tuple[str, ...] = ("audio", "stt")
+
+    @field_validator("stages")
+    @classmethod
+    def _validate_stages(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if not value:
+            raise ValueError("pipeline.stages must list at least one stage")
+        unknown = [s for s in value if s not in STAGE_ORDER]
+        if unknown:
+            raise ValueError(f"pipeline.stages contains unknown stage(s) {unknown}; valid stages are {STAGE_ORDER}")
+        if len(set(value)) != len(value):
+            raise ValueError(f"pipeline.stages contains duplicates: {value}")
+        positions = [STAGE_ORDER.index(s) for s in value]
+        if positions != sorted(positions):
+            raise ValueError(f"pipeline.stages must follow the order {STAGE_ORDER}, got {value}")
+        return value
+
+
 class Config(_Strict):
     paths: PathsConfig
     watcher: WatcherConfig = WatcherConfig()
     stt: SttConfig = SttConfig()
+    pipeline: PipelineConfig = PipelineConfig()
 
 
 def load_config(path: Path) -> Config:

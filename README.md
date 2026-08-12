@@ -11,7 +11,44 @@ internal.
 
 ## Status
 
-Design phase. See [the tech spec](docs/superpowers/specs/2026-08-12-jabberscribe-design.md).
+**Core transcription works.** A recording dropped into `inbox/` is validated,
+normalized, transcribed locally, and written out as a timestamped transcript.
+Delivery to Confluence and email is Plan 2.
+
+```bash
+jabberscribe doctor                          # verify ffmpeg, paths, enabled stages
+jabberscribe process call.wav call.json      # one recording, end to end
+jabberscribe run                             # watch the inbox
+```
+
+See [the tech spec](docs/superpowers/specs/2026-08-12-jabberscribe-design.md) and
+[Plan 1](docs/superpowers/plans/2026-08-12-core-transcription.md).
+
+## Turning capabilities on
+
+Stages are configuration, not code. `pipeline.stages` in
+`config/jabberscribe.yaml` lists what this deployment runs, in order:
+
+```yaml
+pipeline:
+  stages: [audio, stt]        # core: recording -> transcript (available now)
+```
+
+Each outer capability switches on by adding its stage name once it exists:
+
+| Stage | Adds | Status |
+|---|---|---|
+| `audio` | ffmpeg normalize, channel split | available |
+| `stt` | local Hebrew transcription | available |
+| `enrich` | Hebrew summary via local Ollama | Plan 2 |
+| `render` | Confluence XHTML + mail bodies | Plan 2 |
+| `publish` | Confluence page per call | Plan 2 |
+| `notify` | email to participants | Plan 2 |
+
+Enabling a stage that does not exist yet is reported by `jabberscribe doctor`
+at startup rather than failing partway through someone's call. Stages are
+checkpointed per job, so adding one only does the new work — already-transcribed
+calls are not re-transcribed.
 
 ## Scope boundary
 

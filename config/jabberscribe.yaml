@@ -9,6 +9,21 @@ watcher:
   poll_seconds: 30
   min_age_seconds: 15
 
+# Activation switch. Stages run in this order; each one is checkpointed, so a
+# crash resumes at the first incomplete stage rather than starting over.
+#
+# Implemented today: audio, stt
+# Landing with Plan 2:  enrich, render, publish, notify
+#
+# Add a stage name here once it exists to turn it on. `jabberscribe doctor`
+# reports any stage that is enabled but not yet implemented, so activating one
+# early tells you at startup instead of failing partway through a call.
+pipeline:
+  stages: [audio, stt]
+  # stages: [audio, stt, render, publish]          # + Confluence page
+  # stages: [audio, stt, render, publish, notify]  # + participant email
+  # stages: [audio, stt, enrich, render, publish, notify]  # + Hebrew summary
+
 stt:
   model: ivrit-ai/whisper-large-v3-turbo-ct2
   compute_type: int8
