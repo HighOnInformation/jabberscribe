@@ -7,13 +7,20 @@ silently at 2 a.m. Subcommands are added by later tasks.
 from __future__ import annotations
 
 import argparse
+import json
+import logging
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from jabberscribe.config import Config, ConfigError, load_config
+from jabberscribe.jobs import JobStore
+from jabberscribe.pipeline import run_once, unimplemented
+from jabberscribe.stt import WhisperLocal, load_vocabulary
+from jabberscribe.watcher import scan_once
 
 DEFAULT_CONFIG = Path("config/jabberscribe.yaml")
 
@@ -53,10 +60,24 @@ def _check_dir(name: str, path: Path) -> Check:
     return Check(name, True, str(path))
 
 
+def _check_stages(cfg: Config) -> Check:
+    """Report stages that are enabled but not implemented yet.
+
+    Activating an outer stage before it exists is a config mistake worth
+    catching at startup rather than partway through someone's call.
+    """
+    enabled = ", ".join(cfg.pipeline.stages)
+    missing = unimplemented(cfg.pipeline.stages)
+    if missing:
+        return Check("pipeline.stages", False, f"enabled but not implemented: {', '.join(missing)} (of {enabled})")
+    return Check("pipeline.stages", True, enabled)
+
+
 def doctor(cfg: Config) -> list[Check]:
     """Verify the environment. Creates missing directories as a side effect."""
     return [
         _check_ffmpeg(),
+        _check_stages(cfg),
         _check_dir("paths.drop_root/inbox", cfg.paths.inbox),
         _check_dir("paths.drop_root/quarantine", cfg.paths.quarantine),
         _check_dir("paths.work_dir", cfg.paths.work_dir),
@@ -65,11 +86,30 @@ def doctor(cfg: Config) -> list[Check]:
     ]
 
 
+def _transcriber(cfg: Config) -> WhisperLocal:
+    device = cfg.stt.device
+    if device == "auto":
+        device = "cpu"  # CUDA selection is a deployment decision, made explicit in config
+    return WhisperLocal(
+        model=cfg.stt.model,
+        compute_type=cfg.stt.compute_type,
+        device=device,
+        vocabulary=load_vocabulary(cfg.stt.vocabulary_file),
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="jabberscribe")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="path to jabberscribe.yaml")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("doctor", help="verify environment and create missing directories")
+
+    process_cmd = sub.add_parser("process", help="process one recording from a path pair")
+    process_cmd.add_argument("audio", type=Path)
+    process_cmd.add_argument("sidecar", type=Path)
+
+    run_cmd = sub.add_parser("run", help="watch the inbox and process jobs")
+    run_cmd.add_argument("--once", action="store_true", help="single pass, then exit")
     return parser
 
 
@@ -86,6 +126,40 @@ def main(argv: list[str] | None = None) -> int:
         for check in checks:
             print(f"[{'OK ' if check.ok else 'FAIL'}] {check.name}: {check.detail}")
         return 0 if all(c.ok for c in checks) else 1
+
+    if args.command == "process":
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+        doctor(cfg)  # ensure directories exist
+        store = JobStore(cfg.paths.db_path)
+        store.init_schema()
+        shutil.copy2(args.audio, cfg.paths.inbox / args.audio.name)
+        shutil.copy2(args.sidecar, cfg.paths.inbox / args.sidecar.name)
+        # min_age 0: a human handing us one file is not racing a recorder.
+        result = scan_once(cfg, store, min_age_seconds=0)
+        if result.quarantined:
+            print(f"quarantined: {', '.join(result.quarantined)}", file=sys.stderr)
+            return 1
+        run_once(cfg, store, _transcriber(cfg))
+        for call_id in result.enqueued:
+            job = store.get(call_id)
+            print(f"{call_id}: {job.status} -> {job.transcript_path}")
+            if job.transcript_path and job.transcript_path.is_file():
+                payload = json.loads(job.transcript_path.read_text(encoding="utf-8"))
+                print(f"  {len(payload['segments'])} segments")
+        return 0
+
+    if args.command == "run":
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+        doctor(cfg)
+        store = JobStore(cfg.paths.db_path)
+        store.init_schema()
+        transcriber = _transcriber(cfg)
+        while True:
+            scan_once(cfg, store)
+            run_once(cfg, store, transcriber)
+            if args.once:
+                return 0
+            time.sleep(cfg.watcher.poll_seconds)
 
     raise AssertionError(f"unhandled command: {args.command}")
 

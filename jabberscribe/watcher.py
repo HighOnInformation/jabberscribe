@@ -90,7 +90,8 @@ def scan_once(cfg: Config, store: JobStore, min_age_seconds: int | None = None) 
 
     for audio, sidecar_path in find_ready_pairs(cfg.paths.inbox, min_age):
         try:
-            sidecar = parse_sidecar(sidecar_path.read_text(encoding="utf-8"))
+            # utf-8-sig tolerates a BOM and is identical to utf-8 without one.
+            sidecar = parse_sidecar(sidecar_path.read_text(encoding="utf-8-sig"))
         except (SidecarError, OSError, UnicodeDecodeError) as exc:
             quarantine_pair([audio, sidecar_path], cfg.paths.quarantine, str(exc))
             quarantined.append(sidecar_path.stem)

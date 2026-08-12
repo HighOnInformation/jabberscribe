@@ -78,6 +78,10 @@ def parse_sidecar(text: str) -> Sidecar:
 
     Raises SidecarError for anything the pipeline cannot work with.
     """
+    # Strip a leading BOM. PowerShell, .NET, and Notepad all emit UTF-8 with a
+    # BOM by default, so a recorder written in any of them would otherwise have
+    # every one of its sidecars rejected.
+    text = text.lstrip("﻿")
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:

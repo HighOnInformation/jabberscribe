@@ -61,3 +61,39 @@ def test_load_config_rejects_unknown_device(tmp_path: Path) -> None:
 def test_load_config_missing_file(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="not found"):
         load_config(tmp_path / "nope.yaml")
+
+
+def _write(tmp_path: Path, extra: str) -> Path:
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text(MINIMAL_YAML + extra, encoding="utf-8")
+    return cfg_file
+
+
+def test_pipeline_defaults_to_core_stages(tmp_path: Path) -> None:
+    assert load_config(_write(tmp_path, "")).pipeline.stages == ("audio", "stt")
+
+
+def test_pipeline_stages_can_be_extended(tmp_path: Path) -> None:
+    cfg = load_config(_write(tmp_path, "\npipeline:\n  stages: [audio, stt, render, publish]\n"))
+
+    assert cfg.pipeline.stages == ("audio", "stt", "render", "publish")
+
+
+def test_pipeline_rejects_unknown_stage(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="unknown stage"):
+        load_config(_write(tmp_path, "\npipeline:\n  stages: [audio, telepathy]\n"))
+
+
+def test_pipeline_rejects_out_of_order_stages(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="order"):
+        load_config(_write(tmp_path, "\npipeline:\n  stages: [publish, audio]\n"))
+
+
+def test_pipeline_rejects_duplicate_stages(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="duplicates"):
+        load_config(_write(tmp_path, "\npipeline:\n  stages: [audio, audio, stt]\n"))
+
+
+def test_pipeline_rejects_empty_stage_list(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="at least one"):
+        load_config(_write(tmp_path, "\npipeline:\n  stages: []\n"))
