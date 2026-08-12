@@ -1,7 +1,7 @@
 # JabberScribe — Technical Specification
 
 **Date:** 2026-08-12
-**Status:** Approved for implementation
+**Status:** Approved. Core (§13 steps 1-5) implemented; delivery and lifecycle pending.
 **Author:** Design session (brainstorming skill)
 
 ---
@@ -345,6 +345,9 @@ watcher:
   poll_seconds: 30
   min_age_seconds: 15
 
+pipeline:
+  stages: [audio, stt]    # see 9.0 -- the activation switch
+
 stt:
   model: ivrit-ai/whisper-large-v3-turbo-ct2
   compute_type: int8
@@ -378,6 +381,25 @@ retention:
 
 Secrets: `JABBERSCRIBE_CONFLUENCE_PAT`, `JABBERSCRIBE_SMTP_USER`,
 `JABBERSCRIBE_SMTP_PASSWORD`.
+
+### 9.0 Staged activation
+
+`pipeline.stages` lists the stages this deployment runs, in order. It is the
+activation switch for the whole system: the core (`audio`, `stt`) runs on its
+own, and each outer capability comes on by adding its stage name once that stage
+exists. Nothing else changes — the resume logic in §7 already walks a stage list
+rather than a fixed sequence.
+
+Three properties make this safe rather than merely convenient:
+
+- **Validated at load.** Unknown stages, duplicates, and out-of-order lists are
+  rejected by config validation, not discovered at runtime.
+- **Reported at startup.** A stage that is enabled but not yet implemented
+  raises at once and `doctor` flags it, so activating something early tells you
+  immediately instead of failing partway through someone's call.
+- **Incremental, not retroactive.** Because stages checkpoint per job, adding a
+  stage only performs the new work. Calls already transcribed are not
+  re-transcribed when publishing is switched on later.
 
 ### 9.1 Confluence page shape
 
