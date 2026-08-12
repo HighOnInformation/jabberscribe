@@ -1,0 +1,16 @@
+# JabberScribe configuration. Secrets come from environment variables, never here.
+paths:
+  drop_root: D:/jabberscribe/drop
+  work_dir: D:/jabberscribe/work
+  audio_store: D:/jabberscribe/audio
+  db_path: D:/jabberscribe/jabberscribe.db
+
+watcher:
+  poll_seconds: 30
+  min_age_seconds: 15
+
+stt:
+  model: ivrit-ai/whisper-large-v3-turbo-ct2
+  compute_type: int8
+  device: auto
+  vocabulary_file: config/custom_vocabulary.txt
