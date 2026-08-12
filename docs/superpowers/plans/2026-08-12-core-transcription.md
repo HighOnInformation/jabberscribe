@@ -913,9 +913,7 @@ class JobStore:
         return int(row["attempts"])
 
     def list_by_status(self, status: str) -> list[Job]:
-        rows = self._conn.execute(
-            "SELECT * FROM jobs WHERE status = ? ORDER BY created_at", (status,)
-        ).fetchall()
+        rows = self._conn.execute("SELECT * FROM jobs WHERE status = ? ORDER BY created_at", (status,)).fetchall()
         return [_row_to_job(r) for r in rows]
 ```
 
@@ -1948,9 +1946,7 @@ def test_mixed_track_gets_no_speaker_label() -> None:
 
 
 def test_overlapping_speech_is_kept_not_dropped() -> None:
-    merged = merge_tracks(
-        {"near": [Segment(0.0, 2.0, "אני מדבר")], "far": [Segment(1.0, 3.0, "וגם אני")]}
-    )
+    merged = merge_tracks({"near": [Segment(0.0, 2.0, "אני מדבר")], "far": [Segment(1.0, 3.0, "וגם אני")]})
 
     assert len(merged) == 2
 
@@ -2129,9 +2125,7 @@ def merge_tracks(per_track: dict[str, list[Segment]]) -> list[Segment]:
     labelled: list[Segment] = []
     for label, segments in per_track.items():
         speaker = None if label == MIXED_LABEL else label
-        labelled.extend(
-            Segment(start=s.start, end=s.end, text=s.text, speaker=speaker) for s in segments
-        )
+        labelled.extend(Segment(start=s.start, end=s.end, text=s.text, speaker=speaker) for s in segments)
     labelled.sort(key=lambda s: (s.start, s.speaker or "", s.end))
     return labelled
 ```
@@ -2318,9 +2312,7 @@ def write_transcript(path: Path, segments: list[Segment], call_id: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "call_id": call_id,
-        "segments": [
-            {"start": s.start, "end": s.end, "text": s.text, "speaker": s.speaker} for s in segments
-        ],
+        "segments": [{"start": s.start, "end": s.end, "text": s.text, "speaker": s.speaker} for s in segments],
     }
     tmp = path.with_suffix(path.suffix + ".part")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
