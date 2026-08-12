@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Secrets and local config
+.env
+.env.local
+*.pat
+
+# Runtime data — never commit recorded audio or transcripts
+inbox/
+quarantine/
+audio_store/
+output/
+logs/
+*.wav
+*.mp3
+*.m4a
+*.db
+*.db-journal
+*.db-wal
+*.sqlite3
+
+# STT model cache
+models/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
