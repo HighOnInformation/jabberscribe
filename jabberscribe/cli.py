@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -16,7 +17,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from jabberscribe.audit import AuditLog
 from jabberscribe.config import Config, ConfigError, load_config
+from jabberscribe.confluence import ConfluenceClient
 from jabberscribe.jobs import JobStore
 from jabberscribe.pipeline import run_once, unimplemented
 from jabberscribe.stt import WhisperLocal, load_vocabulary
@@ -98,6 +101,26 @@ def _transcriber(cfg: Config) -> WhisperLocal:
     )
 
 
+def _confluence(cfg: Config) -> ConfluenceClient | None:
+    """Build a Confluence client when publishing is enabled.
+
+    The PAT comes from the environment only. Refusing to start without it beats
+    discovering it missing when the first call reaches the publish stage.
+    """
+    if cfg.confluence is None or "publish" not in cfg.pipeline.stages:
+        return None
+    pat = os.environ.get("JABBERSCRIBE_CONFLUENCE_PAT")
+    if not pat:
+        raise ConfigError("publish is enabled but JABBERSCRIBE_CONFLUENCE_PAT is not set")
+    return ConfluenceClient(cfg.confluence.base_url, pat)
+
+
+def _audit(cfg: Config) -> AuditLog:
+    audit = AuditLog(cfg.paths.db_path)
+    audit.init_schema()
+    return audit
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="jabberscribe")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="path to jabberscribe.yaml")
@@ -139,7 +162,12 @@ def main(argv: list[str] | None = None) -> int:
         if result.quarantined:
             print(f"quarantined: {', '.join(result.quarantined)}", file=sys.stderr)
             return 1
-        run_once(cfg, store, _transcriber(cfg))
+        try:
+            confluence = _confluence(cfg)
+        except ConfigError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        run_once(cfg, store, _transcriber(cfg), audit=_audit(cfg), confluence=confluence)
         for call_id in result.enqueued:
             job = store.get(call_id)
             print(f"{call_id}: {job.status} -> {job.transcript_path}")
@@ -154,9 +182,15 @@ def main(argv: list[str] | None = None) -> int:
         store = JobStore(cfg.paths.db_path)
         store.init_schema()
         transcriber = _transcriber(cfg)
+        try:
+            confluence = _confluence(cfg)
+        except ConfigError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        audit = _audit(cfg)
         while True:
             scan_once(cfg, store)
-            run_once(cfg, store, transcriber)
+            run_once(cfg, store, transcriber, audit=audit, confluence=confluence)
             if args.once:
                 return 0
             time.sleep(cfg.watcher.poll_seconds)
