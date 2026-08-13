@@ -117,15 +117,17 @@ def test_run_once_on_empty_queue_returns_zero(cfg) -> None:
 
 
 def test_enabling_an_unimplemented_stage_fails_clearly(cfg, make_wav, make_sidecar) -> None:
-    """Turning on an outer stage before it exists must say so, not crash oddly."""
-    staged = cfg.model_copy(
-        update={"pipeline": cfg.pipeline.model_copy(update={"stages": ("audio", "stt", "publish")})}
-    )
+    """Turning on an outer stage before it exists must say so, not crash oddly.
+
+    `enrich` is the remaining unimplemented stage; render/publish/notify landed
+    with Plan 2.
+    """
+    staged = cfg.model_copy(update={"pipeline": cfg.pipeline.model_copy(update={"stages": ("audio", "stt", "enrich")})})
     store = _store(staged)
     _enqueue(staged, store, make_wav, make_sidecar)
     job = store.claim_next()
 
-    with pytest.raises(StageNotImplementedError, match="publish"):
+    with pytest.raises(StageNotImplementedError, match="enrich"):
         process_job(job, staged, store, FakeTranscriber())
 
 
