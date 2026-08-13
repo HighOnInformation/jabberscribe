@@ -123,9 +123,7 @@ def test_notify_stage_without_mail_config_is_rejected(tmp_path: Path) -> None:
 
 
 def test_full_delivery_pipeline_config_is_accepted(tmp_path: Path) -> None:
-    extra = (
-        "\npipeline:\n  stages: [audio, stt, render, publish, notify]\n" + CONFLUENCE_YAML + MAIL_YAML
-    )
+    extra = "\npipeline:\n  stages: [audio, stt, render, publish, notify]\n" + CONFLUENCE_YAML + MAIL_YAML
 
     cfg = load_config(_write(tmp_path, extra))
 
@@ -435,9 +433,7 @@ class AuditLog:
             rows = self._conn.execute("SELECT * FROM audit_log ORDER BY id").fetchall()
         else:
             rows = self._conn.execute("SELECT * FROM audit_log WHERE call_id = ? ORDER BY id", (call_id,)).fetchall()
-        return [
-            AuditEntry(r["call_id"], r["action"], r["detail"] or "", r["actor"], r["at"]) for r in rows
-        ]
+        return [AuditEntry(r["call_id"], r["action"], r["detail"] or "", r["actor"], r["at"]) for r in rows]
 ```
 
 - [ ] **Step 5: Run, lint, commit, merge**
@@ -756,7 +752,8 @@ def render_confluence_body(
     audio_note: str | None,
 ) -> str:
     rows = "".join(
-        f"<tr><th>{escape(label)}</th><td>{escape(value)}</td></tr>" for label, value in _metadata_rows(sidecar, audio_note)
+        f"<tr><th>{escape(label)}</th><td>{escape(value)}</td></tr>"
+        for label, value in _metadata_rows(sidecar, audio_note)
     )
     summary_html = f"<p>{escape(summary)}</p>" if summary else f"<p><em>{escape(_NO_SUMMARY_HE)}</em></p>"
     transcript_html = "".join(
@@ -1178,23 +1175,25 @@ class ConfluenceClient:
 Insert after `set_transcript_path`:
 
 ```python
-    def set_page_id(self, call_id: str, page_id: str) -> None:
-        self._conn.execute(
-            "UPDATE jobs SET confluence_page_id = ?, updated_at = ? WHERE call_id = ?",
-            (page_id, utcnow(), call_id),
-        )
+def set_page_id(self, call_id: str, page_id: str) -> None:
+    self._conn.execute(
+        "UPDATE jobs SET confluence_page_id = ?, updated_at = ? WHERE call_id = ?",
+        (page_id, utcnow(), call_id),
+    )
 
-    def set_summary_path(self, call_id: str, path: Path) -> None:
-        self._conn.execute(
-            "UPDATE jobs SET summary_path = ?, updated_at = ? WHERE call_id = ?",
-            (str(path), utcnow(), call_id),
-        )
 
-    def mark_notified(self, call_id: str, at: str) -> None:
-        self._conn.execute(
-            "UPDATE jobs SET notified_at = ?, updated_at = ? WHERE call_id = ?",
-            (at, utcnow(), call_id),
-        )
+def set_summary_path(self, call_id: str, path: Path) -> None:
+    self._conn.execute(
+        "UPDATE jobs SET summary_path = ?, updated_at = ? WHERE call_id = ?",
+        (str(path), utcnow(), call_id),
+    )
+
+
+def mark_notified(self, call_id: str, at: str) -> None:
+    self._conn.execute(
+        "UPDATE jobs SET notified_at = ?, updated_at = ? WHERE call_id = ?",
+        (at, utcnow(), call_id),
+    )
 ```
 
 - [ ] **Step 6: Implement `jabberscribe/publish.py`**
@@ -1631,9 +1630,7 @@ def notify_call(
         to = [cfg.mail.fallback_to]
         # Name AND extension: whoever picks this up needs enough to identify the
         # participant in the directory, and the extension is often the only handle.
-        unresolved = ", ".join(
-            f"{p.display_name or '?'} (ext {p.extension or '-'})" for p in sidecar.participants
-        )
+        unresolved = ", ".join(f"{p.display_name or '?'} (ext {p.extension or '-'})" for p in sidecar.participants)
         body = f"{body}\n\nNo participant email could be resolved. Participants: {unresolved}\n"
         rendered = RenderedCall(
             title=rendered.title,
@@ -1777,8 +1774,13 @@ def test_full_pipeline_publishes_and_mails(cfg, make_wav, make_sidecar) -> None:
     client, sent = FakeConfluence(), []
 
     process_job(
-        store.claim_next(), staged, store, FakeTranscriber(),
-        audit=audit, confluence=client, mail_sender=lambda c, m, r: sent.append(r),
+        store.claim_next(),
+        staged,
+        store,
+        FakeTranscriber(),
+        audit=audit,
+        confluence=client,
+        mail_sender=lambda c, m, r: sent.append(r),
     )
 
     job = store.get("d1")
@@ -1815,8 +1817,13 @@ def test_ambiguous_mail_leaves_job_needing_review(cfg, make_wav, make_sidecar) -
 
     with pytest.raises(AmbiguousSendError):
         process_job(
-            store.claim_next(), staged, store, FakeTranscriber(),
-            audit=audit, confluence=FakeConfluence(), mail_sender=disconnect,
+            store.claim_next(),
+            staged,
+            store,
+            FakeTranscriber(),
+            audit=audit,
+            confluence=FakeConfluence(),
+            mail_sender=disconnect,
         )
 
     assert store.get("d1").status == NEEDS_REVIEW
@@ -1844,8 +1851,13 @@ def test_transcript_json_is_still_written(cfg, make_wav, make_sidecar) -> None:
     store, audit = _setup(staged, make_wav, make_sidecar)
 
     path = process_job(
-        store.claim_next(), staged, store, FakeTranscriber(),
-        audit=audit, confluence=FakeConfluence(), mail_sender=lambda c, m, r: None,
+        store.claim_next(),
+        staged,
+        store,
+        FakeTranscriber(),
+        audit=audit,
+        confluence=FakeConfluence(),
+        mail_sender=lambda c, m, r: None,
     )
 
     assert json.loads(path.read_text(encoding="utf-8"))["call_id"] == "d1"
