@@ -11,18 +11,28 @@ internal.
 
 ## Status
 
-**Core transcription works.** A recording dropped into `inbox/` is validated,
-normalized, transcribed locally, and written out as a timestamped transcript.
-Delivery to Confluence and email is Plan 2.
+**End to end works.** A recording dropped into `inbox/` is validated,
+normalized, transcribed locally, published as a restricted Confluence page, and
+mailed to the participants — with every publish, mail, and deletion audited.
 
 ```bash
 jabberscribe doctor                          # verify ffmpeg, paths, enabled stages
 jabberscribe process call.wav call.json      # one recording, end to end
 jabberscribe run                             # watch the inbox
+jabberscribe purge                           # delete past-retention audio and pages
 ```
 
-See [the tech spec](docs/superpowers/specs/2026-08-12-jabberscribe-design.md) and
-[Plan 1](docs/superpowers/plans/2026-08-12-core-transcription.md).
+Secrets come from the environment, never from config:
+`JABBERSCRIBE_CONFLUENCE_PAT`, `JABBERSCRIBE_SMTP_USER`,
+`JABBERSCRIBE_SMTP_PASSWORD`.
+
+Not built: `enrich`, the local-Ollama Hebrew summary. Everything renders a
+"summary unavailable" notice in its place, so it drops in without touching the
+rest.
+
+See [the tech spec](docs/superpowers/specs/2026-08-12-jabberscribe-design.md),
+[Plan 1](docs/superpowers/plans/2026-08-12-core-transcription.md), and
+[Plan 2](docs/superpowers/plans/2026-08-13-delivery-and-lifecycle.md).
 
 ## Turning capabilities on
 
@@ -40,10 +50,14 @@ Each outer capability switches on by adding its stage name once it exists:
 |---|---|---|
 | `audio` | ffmpeg normalize, channel split | available |
 | `stt` | local Hebrew transcription | available |
-| `enrich` | Hebrew summary via local Ollama | Plan 2 |
-| `render` | Confluence XHTML + mail bodies | Plan 2 |
-| `publish` | Confluence page per call | Plan 2 |
-| `notify` | email to participants | Plan 2 |
+| `enrich` | Hebrew summary via local Ollama | not built |
+| `render` | Confluence XHTML + mail bodies | available |
+| `publish` | Confluence page per call | available |
+| `notify` | email to participants | available |
+
+A stage that needs configuration will not start without it: enabling `publish`
+with no `confluence:` section, or `notify` with no `mail:` section, is rejected
+when the config loads.
 
 Enabling a stage that does not exist yet is reported by `jabberscribe doctor`
 at startup rather than failing partway through someone's call. Stages are
