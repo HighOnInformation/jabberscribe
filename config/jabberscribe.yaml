@@ -24,6 +24,30 @@ pipeline:
   # stages: [audio, stt, render, publish, notify]  # + participant email
   # stages: [audio, stt, enrich, render, publish, notify]  # + Hebrew summary
 
+# Required once 'publish' is in pipeline.stages -- config load refuses otherwise.
+# The PAT comes from JABBERSCRIBE_CONFLUENCE_PAT, never from this file.
+# confluence:
+#   base_url: https://wiki.corp.local
+#   space_key: CALLS
+#   parent_page_id: "123456"
+#   compliance_group: callrec-compliance
+#   attach_audio: false
+
+# Required once 'notify' is in pipeline.stages.
+# Credentials come from JABBERSCRIBE_SMTP_USER / JABBERSCRIBE_SMTP_PASSWORD.
+# mail:
+#   smtp_host: smtp.corp.local
+#   smtp_port: 25
+#   use_tls: false
+#   from_address: jabberscribe@corp.local
+#   compliance_bcc: callrec-archive@corp.local
+#   ops_alert_to: it-ops@corp.local
+#   fallback_to: it-ops@corp.local
+
+retention:
+  audio_days: 90
+  page_days: 365
+
 stt:
   model: ivrit-ai/whisper-large-v3-turbo-ct2
   compute_type: int8

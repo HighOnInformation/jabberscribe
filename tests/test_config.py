@@ -74,9 +74,10 @@ def test_pipeline_defaults_to_core_stages(tmp_path: Path) -> None:
 
 
 def test_pipeline_stages_can_be_extended(tmp_path: Path) -> None:
-    cfg = load_config(_write(tmp_path, "\npipeline:\n  stages: [audio, stt, render, publish]\n"))
+    """`render` needs no config section, so it extends the list on its own."""
+    cfg = load_config(_write(tmp_path, "\npipeline:\n  stages: [audio, stt, render]\n"))
 
-    assert cfg.pipeline.stages == ("audio", "stt", "render", "publish")
+    assert cfg.pipeline.stages == ("audio", "stt", "render")
 
 
 def test_pipeline_rejects_unknown_stage(tmp_path: Path) -> None:
@@ -97,3 +98,60 @@ def test_pipeline_rejects_duplicate_stages(tmp_path: Path) -> None:
 def test_pipeline_rejects_empty_stage_list(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="at least one"):
         load_config(_write(tmp_path, "\npipeline:\n  stages: []\n"))
+
+
+CONFLUENCE_YAML = """
+confluence:
+  base_url: https://wiki.corp.local
+  space_key: CALLS
+  parent_page_id: "123456"
+  compliance_group: callrec-compliance
+"""
+
+MAIL_YAML = """
+mail:
+  smtp_host: smtp.corp.local
+  from_address: jabberscribe@corp.local
+  fallback_to: it-ops@corp.local
+"""
+
+
+def test_delivery_config_is_absent_by_default(tmp_path: Path) -> None:
+    cfg = load_config(_write(tmp_path, ""))
+
+    assert cfg.confluence is None
+    assert cfg.mail is None
+    assert cfg.retention.audio_days == 90
+    assert cfg.retention.page_days == 365
+
+
+def test_confluence_config_parses(tmp_path: Path) -> None:
+    cfg = load_config(_write(tmp_path, CONFLUENCE_YAML))
+
+    assert cfg.confluence.base_url == "https://wiki.corp.local"
+    assert cfg.confluence.space_key == "CALLS"
+    assert cfg.confluence.parent_page_id == "123456"
+    assert cfg.confluence.attach_audio is False
+
+
+def test_publish_stage_without_confluence_config_is_rejected(tmp_path: Path) -> None:
+    extra = "\npipeline:\n  stages: [audio, stt, render, publish]\n"
+
+    with pytest.raises(ConfigError, match="confluence"):
+        load_config(_write(tmp_path, extra))
+
+
+def test_notify_stage_without_mail_config_is_rejected(tmp_path: Path) -> None:
+    extra = "\npipeline:\n  stages: [audio, stt, render, publish, notify]\n" + CONFLUENCE_YAML
+
+    with pytest.raises(ConfigError, match="mail"):
+        load_config(_write(tmp_path, extra))
+
+
+def test_full_delivery_pipeline_config_is_accepted(tmp_path: Path) -> None:
+    extra = "\npipeline:\n  stages: [audio, stt, render, publish, notify]\n" + CONFLUENCE_YAML + MAIL_YAML
+
+    cfg = load_config(_write(tmp_path, extra))
+
+    assert cfg.pipeline.stages == ("audio", "stt", "render", "publish", "notify")
+    assert cfg.mail.smtp_port == 25

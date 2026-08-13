@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
 
 from jabberscribe.jobs import STAGE_ORDER
 
@@ -77,11 +77,53 @@ class PipelineConfig(_Strict):
         return value
 
 
+class ConfluenceConfig(_Strict):
+    base_url: str
+    space_key: str
+    parent_page_id: str
+    compliance_group: str | None = None
+    # Attaching voice recordings to a wiki multiplies the exposure surface for no
+    # reading benefit, so the page links the audio instead by default.
+    attach_audio: bool = False
+
+
+class MailConfig(_Strict):
+    smtp_host: str
+    smtp_port: int = 25
+    use_tls: bool = False
+    from_address: str
+    compliance_bcc: str | None = None
+    ops_alert_to: str | None = None
+    #: Where a transcript goes when no participant email could be resolved.
+    fallback_to: str
+
+
+class RetentionConfig(_Strict):
+    audio_days: int = 90
+    page_days: int = 365
+
+
 class Config(_Strict):
     paths: PathsConfig
     watcher: WatcherConfig = WatcherConfig()
     stt: SttConfig = SttConfig()
     pipeline: PipelineConfig = PipelineConfig()
+    confluence: ConfluenceConfig | None = None
+    mail: MailConfig | None = None
+    retention: RetentionConfig = RetentionConfig()
+
+    @model_validator(mode="after")
+    def _require_config_for_enabled_stages(self) -> Config:
+        """A stage cannot be enabled without the config it needs.
+
+        Catching this at load beats discovering it when the first real call
+        reaches the publish stage.
+        """
+        if "publish" in self.pipeline.stages and self.confluence is None:
+            raise ValueError("pipeline.stages enables 'publish' but no confluence: section is configured")
+        if "notify" in self.pipeline.stages and self.mail is None:
+            raise ValueError("pipeline.stages enables 'notify' but no mail: section is configured")
+        return self
 
 
 def load_config(path: Path) -> Config:
