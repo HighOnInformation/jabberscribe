@@ -194,6 +194,28 @@ class JobStore:
             (str(path), utcnow(), call_id),
         )
 
+    def set_page_id(self, call_id: str, page_id: str) -> None:
+        self._conn.execute(
+            "UPDATE jobs SET confluence_page_id = ?, updated_at = ? WHERE call_id = ?",
+            (page_id, utcnow(), call_id),
+        )
+
+    def set_summary_path(self, call_id: str, path: Path) -> None:
+        self._conn.execute(
+            "UPDATE jobs SET summary_path = ?, updated_at = ? WHERE call_id = ?",
+            (str(path), utcnow(), call_id),
+        )
+
+    def mark_notified(self, call_id: str, at: str) -> None:
+        self._conn.execute(
+            "UPDATE jobs SET notified_at = ?, updated_at = ? WHERE call_id = ?",
+            (at, utcnow(), call_id),
+        )
+
+    def list_all(self) -> list[Job]:
+        rows = self._conn.execute("SELECT * FROM jobs ORDER BY created_at").fetchall()
+        return [_row_to_job(r) for r in rows]
+
     def record_attempt(self, call_id: str, error: str) -> int:
         cur = self._conn.execute(
             "UPDATE jobs SET attempts = attempts + 1, last_error = ?, updated_at = ?"
