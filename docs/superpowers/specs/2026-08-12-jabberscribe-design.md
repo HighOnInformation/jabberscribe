@@ -1,7 +1,7 @@
 # JabberScribe — Technical Specification
 
 **Date:** 2026-08-12
-**Status:** Approved. Core (§13 steps 1-5) implemented; delivery and lifecycle pending.
+**Status:** Implemented, except `enrich` (§13 step 10). Capture (§4.2) remains unchosen and out of scope by design.
 **Author:** Design session (brainstorming skill)
 
 ---
