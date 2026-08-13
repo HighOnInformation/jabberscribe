@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from jabberscribe.audit import AuditLog
@@ -133,6 +134,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run_cmd = sub.add_parser("run", help="watch the inbox and process jobs")
     run_cmd.add_argument("--once", action="store_true", help="single pass, then exit")
+
+    sub.add_parser("purge", help="delete audio and pages past their retention window")
     return parser
 
 
@@ -194,6 +197,24 @@ def main(argv: list[str] | None = None) -> int:
             if args.once:
                 return 0
             time.sleep(cfg.watcher.poll_seconds)
+
+    if args.command == "purge":
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+        from jabberscribe.retention import purge
+
+        store = JobStore(cfg.paths.db_path)
+        store.init_schema()
+        try:
+            confluence = _confluence(cfg)
+        except ConfigError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        result = purge(cfg, store, _audit(cfg), now=datetime.now(UTC), confluence=confluence)
+        print(f"audio deleted: {len(result.audio_deleted)}")
+        print(f"pages deleted: {len(result.pages_deleted)}")
+        for problem in result.errors:
+            print(f"  ! {problem}", file=sys.stderr)
+        return 1 if result.errors else 0
 
     raise AssertionError(f"unhandled command: {args.command}")
 
