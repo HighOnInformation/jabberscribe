@@ -81,8 +81,11 @@ changes.
 
 Audio 90 days, text 365 days, counted from the later of the call's start and
 its arrival. The daily purge also removes leftover STT copies in `work/`,
-quarantined pairs and inbox orphans older than 90 days, and strips call
-metadata from job rows past 365 days. A job still active after the audio window
+quarantined pairs and inbox orphans older than 90 days, and, past 365 days,
+replaces a job row's stored sidecar (parties, names, users) with `{}`. The row
+itself stays: its `job_key` (call id and extension), `conference_id`, paths,
+start time, duration and last error are kept, as are the `audit_log` rows
+naming the `job_key`. A job still active after the audio window
 has its audio deleted and is marked failed (audited); work folders and STT
 copies of active jobs are never swept. Every deletion is audited in the
 database's `audit_log` table. Backups and Volume Shadow Copies ("Previous
@@ -106,7 +109,7 @@ JABBERSCRIBE_LIVE_CONFIG=config/jabberscribe.yaml JABBERSCRIBE_LIVE_CLIP=clip.wa
 
 See [the v2 spec](docs/superpowers/specs/2026-10-07-jabberscribe-v2-design.md),
 [the v2 pipeline plan](docs/superpowers/plans/2026-10-07-v2-pipeline.md) (Tasks 1–7)
-and the hardened plan `.superpowers/plan/2026-10-08-v2-hardened-tasks.md` (Tasks 8–19).
+and [the hardened plan](docs/superpowers/plans/2026-10-08-v2-hardened-tasks.md) (Tasks 8–19).
 
 ## Language
 
