@@ -111,20 +111,36 @@ Sidecar, v2:
 ```
 
 Required: `call_id`, `line_owner`, `started_at`, `duration_sec`, `audio.tracks`.
-`line_owner.user` is the identity the SSO web app will match against.
+`line_owner.user` is the identity the SSO web app will match against; a sidecar without it is
+accepted with a warning. `schema_version` must be `2`. `started_at` must carry a UTC offset, and a
+sidecar whose `started_at` is more than one day in the future is quarantined (a recorder clock fault
+would otherwise create a call retention never purges). `line_owner.extension` is trimmed.
 The dedup key is `(call_id, line_owner.extension)`.
 
 ## 6. Conference grouping
 
 CUCM forks each participating line separately, so a 10-person conference yields up to
-10 recordings. Recordings that share a `conference_id` form one group:
+10 recordings. Recordings that share a `conference_id` **and whose time spans overlap**
+(within `group.settle_seconds`) form one group. A reused `conference_id`, such as a
+recurring Meet-Me number, therefore starts a new group:
 
 - Wait until the group is quiet (no new copy for `group.settle_seconds`, default 60s)
-  or until the ≤15-minute latency budget forces a decision.
+  or until its first copy has waited `group.max_wait_seconds` (default 300s).
 - Pick one copy to transcribe — the longest, ties broken by earliest start.
 - Write one output and record every member's `line_owner` as an owner of it.
 - A copy arriving after the group is processed is attached as an owner without
-  reprocessing.
+  reprocessing — **unless** it is longer and ends more than `group.settle_seconds`
+  after the processed copy. Then it replaces the processed copy: it is transcribed
+  from scratch, the earlier copy's text outputs are deleted (audited as `superseded`),
+  and the group still ends with one output.
+- A copy that bridges several groups merges them; the longest copy wins.
+- A failed copy never keeps its group: the failed primary is merged into the winner and the
+  next-longest copy is processed instead.
+- Superseded outputs are deleted before re-election; if a file is locked, re-election waits for the next poll.
+
+**Deviation pending owner sign-off.** The replacement rule means a meeting can be
+transcribed more than once (extra GPU time). Without it, the first participant to hang
+up decides the transcript, and everyone gets a truncated copy of a longer meeting.
 
 1:1 calls between two employees are **not** grouped: each line owner gets their own
 copy. This keeps ownership simple; the duplicate cost is small at this volume.
@@ -144,7 +160,9 @@ copy. This keeps ownership simple; the duplicate cost is small at this volume.
 **Transcript rules.** Words as spoken, including fillers (אה, אממ), false starts, and
 repetitions — no cleanup. Whisper tends to drop fillers; the STT request carries a
 prompt that shows fillers to bias it toward keeping them. This is best effort, not a
-guarantee.
+guarantee. Segments Whisper most likely invented are dropped: repetition loops
+(`compression_ratio` > 2.4), silence (`no_speech_prob` > 0.6 with `avg_logprob` < -1),
+and echoes of the prompt.
 
 **Action item rules.** Each item has `task`, `owner`, `due`, and `source_ts` (the
 transcript timestamp it came from). `owner` and `due` are filled **only** when stated
@@ -157,10 +175,10 @@ summary failure.
 
 | Stage | On failure |
 |---|---|
-| `audio` | Retry; corrupt input → quarantine |
-| `stt` | Retry with backoff (LiteLLM down/overloaded); job stays queued |
-| `summarize` | Retry once; then degrade to "summary unavailable" and continue |
-| `output` | Retry; failure is a bug and fails loudly |
+| `audio` | Retry with backoff; after 3 attempts (e.g. corrupt input) → `failed` for a human to inspect and `jabberscribe retry` |
+| `stt` | LiteLLM down or overloaded (transport error, 429, 5xx): retry with backoff (30 s doubling, at most 30 min) for as long as it lasts, counted separately from attempts; the job stays queued. Other errors (4xx, bad response): `failed` after 3 attempts |
+| `summarize` | Invalid model output: retry once, then degrade to "summary unavailable" and continue. LiteLLM down or overloaded: retry with backoff, as for `stt`. Other 4xx (wrong model name, rejected parameter): `failed` after 3 attempts, loudly |
+| `output` | Retry with backoff; failure is a bug and fails loudly (`failed` after 3 attempts) |
 
 Every stage is checkpointed; a crash resumes at the first incomplete stage.
 

@@ -1,55 +1,38 @@
-# JabberScribe configuration. Secrets come from environment variables, never here.
+# JabberScribe v2 configuration. Secrets come from environment variables, never here:
+#   JABBERSCRIBE_LITELLM_KEY   LiteLLM API key (leave unset if the server has no auth)
+# Run the service with an absolute --config path: a Windows service starts in C:\Windows\System32.
 paths:
-  drop_root: D:/jabberscribe/drop
+  drop_root: D:/jabberscribe/drop          # the recorder writes into drop_root/inbox
   work_dir: D:/jabberscribe/work
-  audio_store: D:/jabberscribe/audio
-  db_path: D:/jabberscribe/jabberscribe.db
+  out_root: D:/jabberscribe/out            # out/<YYYY>/<MM>/<call>/ -- readable company-wide in the MVP
+  db_path: D:/jabberscribe/jabberscribe-v2.db   # a fresh file: v2 refuses databases from other versions
 
 watcher:
   poll_seconds: 30
   min_age_seconds: 15
 
-# Activation switch. Stages run in this order; each one is checkpointed, so a
-# crash resumes at the first incomplete stage rather than starting over.
-#
-# Implemented today: audio, stt
-# Landing with Plan 2:  enrich, render, publish, notify
-#
-# Add a stage name here once it exists to turn it on. `jabberscribe doctor`
-# reports any stage that is enabled but not yet implemented, so activating one
-# early tells you at startup instead of failing partway through a call.
-pipeline:
-  stages: [audio, stt]
-  # stages: [audio, stt, render, publish]          # + Confluence page
-  # stages: [audio, stt, render, publish, notify]  # + participant email
-  # stages: [audio, stt, enrich, render, publish, notify]  # + Hebrew summary
+# A conference group is the copies of one conference_id whose time spans overlap
+# (within settle_seconds). It is processed once quiet for settle_seconds, or once
+# its first copy has waited max_wait_seconds. A later copy that is longer and ends
+# more than settle_seconds after the processed one replaces it and is reprocessed.
+group:
+  settle_seconds: 60
+  max_wait_seconds: 300
 
-# Required once 'publish' is in pipeline.stages -- config load refuses otherwise.
-# The PAT comes from JABBERSCRIBE_CONFLUENCE_PAT, never from this file.
-# confluence:
-#   base_url: https://wiki.corp.local
-#   space_key: CALLS
-#   parent_page_id: "123456"
-#   compliance_group: callrec-compliance
-#   attach_audio: false
+litellm:
+  base_url: http://litellm.corp.local:4000   # without a trailing /v1
+  timeout_seconds: 600
 
-# Required once 'notify' is in pipeline.stages.
-# Credentials come from JABBERSCRIBE_SMTP_USER / JABBERSCRIBE_SMTP_PASSWORD.
-# mail:
-#   smtp_host: smtp.corp.local
-#   smtp_port: 25
-#   use_tls: false
-#   from_address: jabberscribe@corp.local
-#   compliance_bcc: callrec-archive@corp.local
-#   ops_alert_to: it-ops@corp.local
-#   fallback_to: it-ops@corp.local
+# Model names are LiteLLM model_name values. `jabberscribe doctor` sends a real
+# transcription and a real chat completion to both -- use the names your server lists.
+stt:
+  model: whisper-he
+  vocabulary_file: custom_vocabulary.txt    # relative to this file
+
+summary:
+  model: gemma-3
+  max_chunk_chars: 12000                    # longer transcripts are summarized in chunks, then merged
 
 retention:
   audio_days: 90
-  page_days: 365
-
-stt:
-  model: ivrit-ai/whisper-large-v3-turbo-ct2
-  compute_type: int8
-  device: auto
-  vocabulary_file: config/custom_vocabulary.txt
+  text_days: 365

@@ -100,3 +100,14 @@ def test_absolute_vocabulary_file_is_kept(tmp_path: Path) -> None:
     cfg = load_config(_write(tmp_path, data))
 
     assert cfg.stt.vocabulary_file == tmp_path / "elsewhere" / "vocab.txt"
+
+
+def test_shipped_config_is_valid() -> None:
+    shipped = Path(__file__).resolve().parent.parent / "config" / "jabberscribe.yaml"
+
+    cfg = load_config(shipped)
+
+    assert cfg.retention.audio_days == 90
+    assert cfg.retention.text_days == 365
+    assert cfg.stt.vocabulary_file == shipped.parent / "custom_vocabulary.txt"
+    assert cfg.stt.vocabulary_file.is_file()
