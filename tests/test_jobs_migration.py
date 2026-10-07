@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from jabberscribe.jobs import SCHEMA_VERSION, JobStore, SchemaError
+from jabberscribe.jobs import MIGRATIONS, SCHEMA_VERSION, JobStore, SchemaError
 
 #: The jobs table exactly as schema version 2 (the hardened MVP, feat/v2-pipeline e49c0cb) created it.
 V2_SCHEMA = """
@@ -111,3 +111,101 @@ def test_upgrade_adds_the_latency_columns(tmp_path: Path) -> None:
 
     job = store.get("old_1042")
     assert (job.output_at, job.latency_sec) == (None, None)
+
+
+def _schema(path: Path) -> list[tuple]:
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").fetchall()
+    finally:
+        conn.close()
+
+
+def _columns(path: Path) -> set[str]:
+    conn = sqlite3.connect(path)
+    try:
+        return {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+    finally:
+        conn.close()
+
+
+def test_a_refused_newer_database_is_left_untouched(tmp_path: Path) -> None:
+    db = tmp_path / "js.db"
+    _v2_database(db)
+    conn = sqlite3.connect(db)
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+    conn.commit()
+    conn.close()
+    before = _schema(db)
+
+    with pytest.raises(SchemaError):
+        JobStore(db).init_schema()
+
+    assert _user_version(db) == SCHEMA_VERSION + 1
+    assert _schema(db) == before
+
+
+def test_a_version_below_the_migration_range_is_refused_untouched(tmp_path: Path) -> None:
+    db = tmp_path / "js.db"
+    _v2_database(db)
+    conn = sqlite3.connect(db)
+    conn.execute(f"PRAGMA user_version = {min(MIGRATIONS) - 1}")
+    conn.commit()
+    conn.close()
+    before = _schema(db)
+
+    with pytest.raises(SchemaError):
+        JobStore(db).init_schema()
+
+    assert _user_version(db) == min(MIGRATIONS) - 1
+    assert _schema(db) == before
+
+
+def test_a_step_failing_mid_way_rolls_back(tmp_path: Path, monkeypatch) -> None:
+    db = tmp_path / "js.db"
+    _v2_database(db)
+    # The step's first column is added, then the second statement fails.
+    first = MIGRATIONS[2][0]
+    monkeypatch.setitem(MIGRATIONS, 2, (first, ("hold_reason", "TEXT CHECK (")))
+
+    with pytest.raises(sqlite3.Error):
+        JobStore(db).init_schema()
+
+    assert _user_version(db) == 2
+    assert first[0] not in _columns(db)
+    monkeypatch.undo()
+    store = JobStore(db)
+    store.init_schema()
+    assert store.get("old_1042").legal_hold is False
+
+
+class _RacingConnection:
+    """A connection proxy: another process finishes the upgrade just before this one's BEGIN IMMEDIATE."""
+
+    def __init__(self, conn: sqlite3.Connection, db: Path) -> None:
+        self._conn, self._db, self.statements = conn, db, []
+
+    def execute(self, sql: str, *params):
+        self.statements.append(sql)
+        if sql == "BEGIN IMMEDIATE" and self.statements.count(sql) == 1:
+            other = JobStore(self._db)
+            other.init_schema()
+            other.close()
+        return self._conn.execute(sql, *params)
+
+    def __getattr__(self, name: str):
+        return getattr(self._conn, name)
+
+
+def test_the_version_is_read_again_inside_the_migration_transaction(tmp_path: Path) -> None:
+    db = tmp_path / "js.db"
+    _v2_database(db)
+    store = JobStore(db)
+    racing = _RacingConnection(store._conn, db)
+    store._conn = racing
+
+    store.init_schema()
+
+    assert _user_version(db) == SCHEMA_VERSION
+    assert not any(s.startswith("ALTER TABLE") for s in racing.statements)
+    assert "PRAGMA user_version = 3" not in racing.statements

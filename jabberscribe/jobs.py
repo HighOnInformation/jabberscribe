@@ -90,6 +90,14 @@ class SchemaError(RuntimeError):
     """The database was written by another JabberScribe version."""
 
 
+def _check_version(version: int) -> None:
+    """Refuse a database this version can neither use as it is nor upgrade."""
+    if version != SCHEMA_VERSION and version not in MIGRATIONS:
+        raise SchemaError(
+            f"database schema version {version} is not {SCHEMA_VERSION}; point paths.db_path at a fresh file"
+        )
+
+
 def iso(moment: datetime) -> str:
     """The one timestamp format the store writes, so stored values compare as strings."""
     return moment.astimezone(UTC).isoformat(timespec="seconds")
@@ -178,16 +186,12 @@ class JobStore:
         CREATE TABLE IF NOT EXISTS would silently keep an older jobs table and
         fail later with a cryptic column error, so the version is checked first.
         """
-        version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        version = self._user_version()
         has_jobs = self._conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'").fetchone()
-        if has_jobs and version != SCHEMA_VERSION and version not in MIGRATIONS:
-            raise SchemaError(
-                f"database schema version {version} is not {SCHEMA_VERSION}; point paths.db_path at a fresh file"
-            )
-        if has_jobs:
-            while version != SCHEMA_VERSION:
-                self._migrate(version)
-                version += 1
+        if has_jobs and version != SCHEMA_VERSION:
+            _check_version(version)
+            while self._migrate():
+                pass
         self._conn.executescript(_SCHEMA)
         # A v2 database created before transient_failures existed (pre-release only).
         columns = {r["name"] for r in self._conn.execute("PRAGMA table_info(jobs)")}
@@ -195,19 +199,30 @@ class JobStore:
             self._conn.execute("ALTER TABLE jobs ADD COLUMN transient_failures INTEGER NOT NULL DEFAULT 0")
         self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
-    def _migrate(self, version: int) -> None:
-        """Upgrade from `version` to the next version in one transaction."""
+    def _user_version(self) -> int:
+        return self._conn.execute("PRAGMA user_version").fetchone()[0]
+
+    def _migrate(self) -> bool:
+        """Upgrade by one version in one transaction. Returns False when the database is already current.
+
+        The version is read again inside the transaction: another process may have upgraded it meanwhile.
+        """
         self._conn.execute("BEGIN IMMEDIATE")
         try:
-            present = {r["name"] for r in self._conn.execute("PRAGMA table_info(jobs)")}
-            for name, definition in MIGRATIONS[version]:
-                if name not in present:
-                    self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
-            self._conn.execute(f"PRAGMA user_version = {version + 1}")
+            version = self._user_version()
+            current = version == SCHEMA_VERSION
+            if not current:
+                _check_version(version)
+                present = {r["name"] for r in self._conn.execute("PRAGMA table_info(jobs)")}
+                for name, definition in MIGRATIONS[version]:
+                    if name not in present:
+                        self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
+                self._conn.execute(f"PRAGMA user_version = {version + 1}")
         except Exception:
             self._conn.execute("ROLLBACK")
             raise
         self._conn.execute("COMMIT")
+        return not current
 
     def create(
         self,
