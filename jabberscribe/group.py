@@ -17,6 +17,11 @@ processed from scratch and the old primary's text outputs are deleted
 (audited as superseded). This trades extra GPU time for a complete transcript
 and is a deviation from "processed once" that needs owner sign-off.
 
+A copy that overlaps several primaries -- a late joiner was released on its own --
+merges them into one group under the longest; the others are superseded the
+same way. Outputs are discarded before the database changes, so a file held
+open only delays the change to the next poll.
+
 A FAILED primary never keeps its conference: the next-longest copy is elected.
 """
 
@@ -103,51 +108,102 @@ def _clusters(jobs: list[Job], slack: timedelta) -> list[list[Job]]:
     return clusters
 
 
-def _discard_outputs(cfg: Config, audit: AuditLog, old: Job, new_key: str) -> None:
-    removed = [name for name in TEXT_FILES if (old.out_dir / name).is_file()]
-    for name in removed:
-        (old.out_dir / name).unlink()
+def _discard_outputs(cfg: Config, audit: AuditLog, old: Job, new_key: str) -> bool:
+    """Delete a superseded primary's text outputs and work folder, each best-effort. True when all are gone.
+
+    What was removed is audited. A file a reader holds open stays; the caller
+    then leaves the database alone so the next poll tries again.
+    """
+    targets = [(name, (old.out_dir / name).unlink) for name in TEXT_FILES if (old.out_dir / name).is_file()]
     work = cfg.paths.work_dir / old.job_key
     if work.is_dir():
-        shutil.rmtree(work)
-        removed.append("work")
+        targets.append(("work", lambda: shutil.rmtree(work)))
+    removed: list[str] = []
+    errors: list[OSError] = []
+    for name, remove in targets:
+        try:
+            remove()
+            removed.append(name)
+        except OSError as exc:
+            errors.append(exc)
     if removed:
         audit.record(old.job_key, SUPERSEDED, f"replaced by {new_key}: {', '.join(removed)}")
+    if errors:
+        log.warning("cannot discard outputs of %s yet, retrying next poll: %s", old.job_key, errors[0])
+    return not errors
 
 
-def _hand_over(cfg: Config, store: JobStore, audit: AuditLog, old: Job, new: Job, changes: _Changes) -> Job:
-    """Make `new` the conference's primary, processed from scratch; `old` becomes a member."""
-    store.hand_over(old.job_key, new.job_key)
+def _discard_all(cfg: Config, audit: AuditLog, olds: list[Job], new_key: str) -> bool:
+    # Try every job, even after one fails, so the retry has less left to do.
+    return all([_discard_outputs(cfg, audit, old, new_key) for old in olds])
+
+
+def _promote(store: JobStore, new: Job, olds: list[Job], changes: _Changes) -> None:
+    """Make `new` the conference's primary, processed from scratch; each of `olds` becomes a member."""
+    for old in olds:
+        store.hand_over(old.job_key, new.job_key)
+        changes.superseded.append(old.job_key)
+        log.info("conference %s: %s replaces %s as primary", new.conference_id, new.job_key, old.job_key)
     store.reset_job(new.job_key)
-    _discard_outputs(cfg, audit, old, new.job_key)
     changes.released.append(new.job_key)
-    changes.superseded.append(old.job_key)
-    log.info("conference %s: %s replaces %s as primary", new.conference_id, new.job_key, old.job_key)
-    refreshed = store.get(new.job_key)
-    assert refreshed is not None
-    return refreshed
 
 
-def _attach(store: JobStore, copy: Job, primary: Job, changes: _Changes) -> None:
-    """Attach a late copy. If the primary already wrote result.json, add the owner there first.
+def _attach(store: JobStore, copy: Job, primary: Job, absorbed: list[Job], changes: _Changes) -> bool:
+    """Attach a late copy, and the `absorbed` primaries it bridged, to `primary`.
 
-    When result.json cannot be updated (a reader holds it open), the copy stays
-    WAITING and the next poll tries again; nothing is lost.
+    If the primary already wrote result.json, the new owners are added there
+    first. When it cannot be updated (a reader holds it open), nothing changes,
+    the copy stays WAITING and the next poll tries again.
     """
     if (primary.out_dir / RESULT_FILE).is_file():
         owners = owners_for(primary, store)
+        for job in absorbed:
+            for owner in owners_for(job, store):
+                _add_owner(owners, owner)
         _add_owner(owners, parse_sidecar(copy.sidecar_json).line_owner)
         try:
             update_owners(primary.out_dir, owners)
         except (OSError, ValueError) as exc:
             log.warning("cannot add owner %s to %s yet, retrying next poll: %s", copy.job_key, primary.job_key, exc)
-            return
+            return False
+    for job in absorbed:
+        store.hand_over(job.job_key, primary.job_key)
+        changes.superseded.append(job.job_key)
+        log.info("conference %s: %s absorbs %s", primary.conference_id, primary.job_key, job.job_key)
     store.group_into(copy.job_key, primary.job_key)
     changes.attached.append(copy.job_key)
+    return True
 
 
 def _replaces(copy: Job, primary: Job, slack: timedelta) -> bool:
     return copy.duration_sec > primary.duration_sec and _end(copy) > _end(primary) + slack
+
+
+def _merge(
+    cfg: Config,
+    store: JobStore,
+    audit: AuditLog,
+    copy: Job,
+    overlapping: list[Job],
+    slack: timedelta,
+    changes: _Changes,
+) -> Job | None:
+    """Settle a copy into the live primaries it overlaps, merging them into one group. Returns the winner.
+
+    The longest primary keeps the group unless the copy `_replaces` it; every
+    other overlapping primary is superseded. Losers' outputs go first, so a
+    locked file leaves the database untouched (None) and the next poll retries.
+    """
+    best = min(overlapping, key=_rank)
+    winner = copy if _replaces(copy, best, slack) else best
+    losers = [p for p in overlapping if p.job_key != winner.job_key]
+    if not _discard_all(cfg, audit, losers, winner.job_key):
+        return None
+    if winner is copy:
+        _promote(store, copy, losers, changes)
+    elif not _attach(store, copy, best, losers, changes):
+        return None
+    return store.get(winner.job_key)
 
 
 def _settle_conference(
@@ -159,25 +215,27 @@ def _settle_conference(
     unmatched: list[Job] = []
 
     for copy in sorted((j for j in jobs if j.status == WAITING), key=_rank):
-        index = next((i for i, p in enumerate(primaries) if _overlaps(copy, _span(p, store), slack)), None)
-        if index is None:
-            unmatched.append(copy)
-            continue
-        primary = primaries[index]
-        if primary.status == FAILED:
+        overlapping = [p for p in primaries if _overlaps(copy, _span(p, store), slack)]
+        live = [p for p in overlapping if p.status != FAILED]
+        if live:
+            winner = _merge(cfg, store, audit, copy, live, slack, changes)
+            if winner is not None:
+                primaries = [p for p in primaries if p not in live] + [winner]
+        elif overlapping:
             # Never attach to a failed primary: join as a candidate for the re-election below.
-            store.group_into(copy.job_key, primary.job_key)
-        elif _replaces(copy, primary, slack):
-            primaries[index] = _hand_over(cfg, store, audit, primary, copy, changes)
+            store.group_into(copy.job_key, overlapping[0].job_key)
         else:
-            _attach(store, copy, primary, changes)
+            unmatched.append(copy)
 
     for primary in primaries:
         if primary.status != FAILED:
             continue
         candidates = [m for m in store.members(primary.job_key) if m.status == GROUPED]
-        if candidates:
-            _hand_over(cfg, store, audit, primary, min(candidates, key=_rank), changes)
+        if not candidates:
+            continue
+        chosen = min(candidates, key=_rank)
+        if _discard_outputs(cfg, audit, primary, chosen.job_key):
+            _promote(store, chosen, [primary], changes)
 
     for cluster in _clusters(unmatched, slack):
         arrivals = [datetime.fromisoformat(j.created_at) for j in cluster]
@@ -204,5 +262,9 @@ def settle(
     """
     changes = _Changes()
     for cid in [conference_id] if conference_id else store.conference_ids_to_settle():
-        _settle_conference(cfg, store, audit, now, cid, changes)
+        try:
+            _settle_conference(cfg, store, audit, now, cid, changes)
+        except OSError:
+            # One unreachable folder must not hold up every other conference; the next poll retries.
+            log.warning("cannot settle conference %s yet, retrying next poll", cid, exc_info=True)
     return SettleResult(tuple(changes.released), tuple(changes.attached), tuple(changes.superseded))

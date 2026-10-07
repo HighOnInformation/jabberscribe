@@ -1,7 +1,9 @@
 import json
+import pathlib
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
+from jabberscribe import group
 from jabberscribe.audit import SUPERSEDED
 from jabberscribe.group import SettleResult, owners_for, settle
 from jabberscribe.jobs import DONE, FAILED, GROUPED, QUEUED, RUNNING, WAITING
@@ -257,3 +259,147 @@ def test_settle_can_be_limited_to_one_conference(cfg, store, audit, make_wav, ma
 
     assert _settle(cfg, store, audit, conference_id="conf-1").released == (mine,)
     assert store.get(other).status == WAITING
+
+
+def _lock(monkeypatch, name: str) -> None:
+    """Make `name` undeletable, as when Word holds the file open on Windows."""
+    unlink = pathlib.Path.unlink
+
+    def locked(self, *args, **kwargs):
+        if self.name == name:
+            raise PermissionError(f"{name} is open in Word")
+        return unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", locked)
+
+
+def test_locked_output_delays_the_replacement_until_it_can_be_discarded(
+    cfg, store, audit, make_wav, make_sidecar, monkeypatch
+) -> None:
+    start = "2026-10-07T14:00:00+03:00"
+    leaver = _drop(cfg, store, audit, make_wav, make_sidecar, "a", "1042", started_at=start, duration_sec=480)
+    _release(cfg, store, audit, leaver)
+    _finish(store, leaver)
+    host = _drop(cfg, store, audit, make_wav, make_sidecar, "b", "2210", started_at=start, duration_sec=3600)
+    elsewhere = _drop(cfg, store, audit, make_wav, make_sidecar, "c", "3000", conference_id="conf-2")
+    _age(cfg, elsewhere, 61)
+    _lock(monkeypatch, TRANSCRIPT_FILE)
+
+    result = _settle(cfg, store, audit)
+
+    assert result.released == (elsewhere,)
+    assert store.get(host).status == WAITING
+    assert (store.get(leaver).status, store.get(leaver).grouped_into) == (DONE, None)
+    out_dir = store.get(leaver).out_dir
+    assert (out_dir / TRANSCRIPT_FILE).is_file()
+    assert not (out_dir / RESULT_FILE).exists()
+    entry = audit.entries(leaver)[-1]
+    assert entry.action == SUPERSEDED
+    assert RESULT_FILE in entry.detail
+    assert TRANSCRIPT_FILE not in entry.detail
+
+    monkeypatch.undo()
+    result = _settle(cfg, store, audit)
+
+    assert (result.released, result.superseded) == ((host,), (leaver,))
+    assert (store.get(leaver).status, store.get(leaver).grouped_into) == (GROUPED, host)
+    assert not (out_dir / TRANSCRIPT_FILE).exists()
+    assert TRANSCRIPT_FILE in audit.entries(leaver)[-1].detail
+
+
+def test_os_error_in_one_conference_does_not_stop_the_others(
+    cfg, store, audit, make_wav, make_sidecar, monkeypatch
+) -> None:
+    broken = _drop(cfg, store, audit, make_wav, make_sidecar, "a", "1042", conference_id="conf-1")
+    fine = _drop(cfg, store, audit, make_wav, make_sidecar, "b", "2210", conference_id="conf-2")
+    _age(cfg, broken, 61)
+    _age(cfg, fine, 61)
+    real = group._settle_conference
+
+    def flaky(cfg, store, audit, now, conference_id, changes):
+        if conference_id == "conf-1":
+            raise PermissionError("share is offline")
+        real(cfg, store, audit, now, conference_id, changes)
+
+    monkeypatch.setattr(group, "_settle_conference", flaky)
+
+    assert _settle(cfg, store, audit).released == (fine,)
+    assert store.get(broken).status == WAITING
+
+
+def test_copy_bridging_two_groups_merges_them(cfg, store, audit, make_wav, make_sidecar) -> None:
+    """The leaver and a late joiner were released separately; the host's copy spans both."""
+    leaver = _drop(
+        cfg, store, audit, make_wav, make_sidecar, "a", "1042", started_at="2026-10-07T14:00:00+03:00", duration_sec=480
+    )
+    _release(cfg, store, audit, leaver)
+    _finish(store, leaver)
+    joiner = _drop(
+        cfg, store, audit, make_wav, make_sidecar, "j", "4000", started_at="2026-10-07T14:30:00+03:00", duration_sec=600
+    )
+    assert _release(cfg, store, audit, joiner).released == (joiner,)
+    _finish(store, joiner)
+
+    host = _drop(
+        cfg,
+        store,
+        audit,
+        make_wav,
+        make_sidecar,
+        "b",
+        "2210",
+        started_at="2026-10-07T14:00:00+03:00",
+        duration_sec=3600,
+    )
+    result = _settle(cfg, store, audit)
+
+    assert result.released == (host,)
+    assert sorted(result.superseded) == sorted([leaver, joiner])
+    assert (store.get(host).status, store.get(host).stage) == (QUEUED, QUEUED)
+    assert {m.job_key for m in store.members(host)} == {leaver, joiner}
+    assert not (store.get(joiner).out_dir / TRANSCRIPT_FILE).exists()
+    entry = audit.entries(joiner)[-1]
+    assert (entry.action, host in entry.detail) == (SUPERSEDED, True)
+    assert [o.extension for o in owners_for(store.get(host), store)] == ["2210", "1042", "4000"]
+
+
+def test_done_primary_absorbs_a_bridged_group_without_reprocessing(cfg, store, audit, make_wav, make_sidecar) -> None:
+    first = _drop(
+        cfg,
+        store,
+        audit,
+        make_wav,
+        make_sidecar,
+        "a",
+        "1042",
+        started_at="2026-10-07T14:00:00+03:00",
+        duration_sec=1800,
+    )
+    _release(cfg, store, audit, first)
+    _finish(store, first, owners=[{"extension": "1042"}])
+    second = _drop(
+        cfg, store, audit, make_wav, make_sidecar, "b", "2210", started_at="2026-10-07T14:40:00+03:00", duration_sec=600
+    )
+    _release(cfg, store, audit, second)
+    _finish(store, second)
+
+    bridge = _drop(
+        cfg,
+        store,
+        audit,
+        make_wav,
+        make_sidecar,
+        "c",
+        "3000",
+        started_at="2026-10-07T14:20:00+03:00",
+        duration_sec=1500,
+    )
+    result = _settle(cfg, store, audit)
+
+    assert result == SettleResult(attached=(bridge,), superseded=(second,))
+    assert store.get(first).status == DONE
+    assert (store.get(second).status, store.get(second).grouped_into) == (GROUPED, first)
+    assert store.get(bridge).grouped_into == first
+    assert not (store.get(second).out_dir / RESULT_FILE).exists()
+    assert audit.entries(second)[-1].action == SUPERSEDED
+    assert _owners(store, first) == ["1042", "2210", "3000"]
