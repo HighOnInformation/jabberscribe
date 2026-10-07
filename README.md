@@ -16,7 +16,7 @@ designed (see the spec) but not built; until it is, recordings are dropped in
 by hand or by any recorder that follows the drop contract.
 
 ```bash
-jabberscribe --config D:/jabberscribe/jabberscribe.yaml doctor     # ffmpeg, paths, real LiteLLM chat + transcription probes
+jabberscribe --config D:/jabberscribe/jabberscribe.yaml doctor     # ffmpeg, ffprobe, paths, real LiteLLM chat + transcription probes
 jabberscribe --config ... process call.wav call.json   # one recording, end to end (only that job; exit 0 only if it is DONE)
 jabberscribe --config ... run                          # watch the inbox; purges once a day
 jabberscribe --config ... purge                        # delete past-retention audio and text now
@@ -73,10 +73,14 @@ and no response cache to the Whisper and Gemma routes.
 **Speaker labels.** A dual-track call is transcribed one channel at a time,
 and every line names its speaker: `[00:03:12] מאיר חדד: ...`. The near end
 (channel `stt.near_channel`) is the recorded line's `display_name`; the far end
-is the other party's on a 1:1 call, `משתתפים` on a conference (no
-diarization), and `צד א` / `צד ב` when a name is missing. A silent channel is
-not transcribed. Mixed-track calls carry no labels. `stt.split_channels: false`
-turns this off (one STT call per call instead of two).
+is the other party's on a 1:1 call with exactly one listed party, `משתתפים` on
+a conference (no diarization), and `צד א` / `צד ב` when a name is missing or the
+sidecar lists zero or several parties. A silent channel is not transcribed.
+Mixed-track calls carry no labels, and so does a "dual" sidecar whose audio is
+mono or cannot be split (it falls back to the downmix, as it does when
+`ffprobe` is missing — `doctor` checks for it). `stt.split_channels: false`
+turns this off (one STT call per call instead of two). Generic labels never
+make a speaker the owner of an action item; only a real name can.
 
 **Bracket cues.** With `pip install .[cues]`, the PANNs checkpoint at
 `cues.model_path` and the AudioSet label file in the service account's
@@ -116,8 +120,10 @@ windows.
 **Legal hold.** `jabberscribe hold <job_key> --reason "<case>"` exempts a call
 — and every copy of its conference — from purge until `jabberscribe unhold`.
 A held conference's earlier output is also kept when a longer copy replaces
-it. Every hold and release is audited with the OS account that ran it;
-`status` lists the held calls.
+it. Every hold and release is audited with the OS account that ran it (the
+audit row is written before the release; a release that then fails is audited
+as `unhold_failed`); `status` lists the held calls, and `unhold` on a copy that
+is not itself held names the copy that holds the call.
 
 ## Monitoring
 
@@ -129,8 +135,8 @@ of the last 24 hours (p50 and p95; the budget is 15 min) and the heartbeat age.
 Alerts are off by default. Set `alerts.webhook_url` (or
 `JABBERSCRIBE_ALERT_WEBHOOK_URL`) to get a JSON POST, with a `text` field Teams
 and Slack render as is, when a call fails, when a call has waited more than
-`alerts.backlog_minutes`, when LiteLLM does not answer (`run` probes it every
-poll; `doctor` alerts too), or when the purge cannot delete something. Each
+`alerts.backlog_minutes`, when LiteLLM does not answer (with alerts on, `run`
+probes it every poll; `doctor` alerts too), or when the purge cannot delete something. Each
 kind is sent at most once an hour. Delivery never raises: a failed delivery is
 logged (status code or error type only — the webhook URL is never logged) and
 that kind is not retried for 5 minutes. Alerts carry job keys and counts, never
@@ -157,6 +163,11 @@ See [the v2 spec](docs/superpowers/specs/2026-10-07-jabberscribe-v2-design.md),
 [the v2 pipeline plan](docs/superpowers/plans/2026-10-07-v2-pipeline.md) (Tasks 1–7),
 [the hardened plan](docs/superpowers/plans/2026-10-08-v2-hardened-tasks.md) (Tasks 8–19)
 and [the extras plan](docs/superpowers/plans/2026-10-08-v2-extras-tasks.md) (Tasks E1–E7).
+
+**Owner sign-off pending.** The extras plan's header lists the "Defaults chosen
+without the owner — confirm" (channel convention, speaker labels, cue labels and
+thresholds, legal-hold policy, alert payloads); spec §6 marks the conference
+re-processing deviation.
 
 ## Language
 
