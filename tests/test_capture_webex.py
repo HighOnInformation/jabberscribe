@@ -408,13 +408,13 @@ def test_metadata_party_fields_win_over_details_in_an_export(wcfg: WebexConfig, 
 
 
 @needs_ffmpeg
-def test_watcher_accepts_the_exported_pair(wcfg: WebexConfig, cfg: Config, mp3_bytes) -> None:
+def test_watcher_accepts_the_exported_pair(wcfg: WebexConfig, cfg: Config, audit, mp3_bytes) -> None:
     wcfg = wcfg.model_copy(update={"inbox": cfg.paths.inbox})
     _exporter(wcfg, FakeWebex([_recording()], mp3_bytes(1))).run_once()
     store = JobStore(cfg.paths.db_path)
     store.init_schema()
     try:
-        assert scan_once(cfg, store).enqueued == (job_key("wxc-sess-1", "1042"),)
+        assert scan_once(cfg, store, audit).enqueued == (job_key("wxc-sess-1", "1042"),)
     finally:
         store.close()
 
@@ -547,7 +547,7 @@ def test_export_logs_never_contain_download_urls_or_the_token(
 
 @needs_ffmpeg
 def test_crash_between_pair_write_and_ledger_mark_is_a_watcher_duplicate(
-    wcfg: WebexConfig, cfg: Config, mp3_bytes, monkeypatch
+    wcfg: WebexConfig, cfg: Config, audit, mp3_bytes, monkeypatch
 ) -> None:
     wcfg = wcfg.model_copy(update={"inbox": cfg.paths.inbox})
     fake = FakeWebex([_recording()], mp3_bytes(1))
@@ -564,10 +564,10 @@ def test_crash_between_pair_write_and_ledger_mark_is_a_watcher_duplicate(
     store = JobStore(cfg.paths.db_path)
     store.init_schema()
     try:
-        assert scan_once(cfg, store).enqueued == (key,)  # the watcher took the first pair
+        assert scan_once(cfg, store, audit).enqueued == (key,)  # the watcher took the first pair
         again = _exporter(wcfg, fake).run_once()
         assert again.exported == (key,)  # same key after the re-export
-        assert scan_once(cfg, store).skipped == (key,)  # discarded as a duplicate
+        assert scan_once(cfg, store, audit).skipped == (key,)  # discarded as a duplicate
         assert _inbox(wcfg) == []
     finally:
         store.close()
