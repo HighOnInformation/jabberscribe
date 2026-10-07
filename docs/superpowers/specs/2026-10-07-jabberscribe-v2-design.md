@@ -181,7 +181,12 @@ transcript timestamp it came from). `owner` and `due` are filled **only** when s
 in the call; otherwise they are empty, never guessed. The LLM returns JSON validated
 against a schema; invalid output is retried once, then the job completes with
 "summary unavailable" rather than failing — the transcript must never be lost to a
-summary failure.
+summary failure. The same holds when the chat route rejects the input itself (HTTP 400,
+413 or 422, e.g. the context window exceeded): no retry, "summary unavailable". The
+reason is recorded in `result.json` as `summary_error` (null when a summary exists).
+Transcripts longer than `summary.max_chunk_chars` are summarized per chunk; the chunk
+summaries are merged in batches that fit `max_chunk_chars`, repeatedly, until one is left,
+so the merge prompt is bounded too.
 
 ## 8. Failure handling
 
@@ -189,7 +194,7 @@ summary failure.
 |---|---|
 | `audio` | Retry with backoff; after 3 attempts (e.g. corrupt input) → `failed` for a human to inspect and `jabberscribe retry` |
 | `stt` | LiteLLM down or overloaded (transport error, 429, 5xx): retry with backoff (30 s doubling, at most 30 min) for as long as it lasts, counted separately from attempts; the job stays queued. Other errors (4xx, bad response): `failed` after 3 attempts |
-| `summarize` | Invalid model output: retry once, then degrade to "summary unavailable" and continue. LiteLLM down or overloaded: retry with backoff, as for `stt`. Other 4xx (wrong model name, rejected parameter): `failed` after 3 attempts, loudly |
+| `summarize` | Invalid model output: retry once, then degrade to "summary unavailable" and continue. HTTP 400, 413 or 422 (input rejected, e.g. context length): degrade at once, reason in `summary_error`. LiteLLM down or overloaded: retry with backoff, as for `stt`. Other 4xx (401/403 bad key, 404 wrong model name): `failed` after 3 attempts, loudly — `doctor` catches these at install |
 | `output` | Retry with backoff; failure is a bug and fails loudly (`failed` after 3 attempts) |
 
 Every stage is checkpointed; a crash resumes at the first incomplete stage.

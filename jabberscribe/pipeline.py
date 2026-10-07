@@ -39,7 +39,7 @@ from jabberscribe.llm import TransientError
 from jabberscribe.output import RESULT_FILE, write_atomic, write_outputs
 from jabberscribe.sidecar import Sidecar, parse_sidecar
 from jabberscribe.stt import Segment, Transcriber
-from jabberscribe.summarize import ActionItem, Summarizer, Summary
+from jabberscribe.summarize import ActionItem, Summarizer, Summary, SummaryUnavailable
 
 log = logging.getLogger(__name__)
 
@@ -65,18 +65,31 @@ def _read_segments(path: Path) -> list[Segment]:
     return [Segment(**s) for s in json.loads(path.read_text(encoding="utf-8"))]
 
 
-def _write_summary(path: Path, summary: Summary | None) -> None:
-    payload = None
+def _summarize(summarizer: Summarizer, segments: list[Segment]) -> tuple[Summary | None, str | None]:
+    """The summary, or None and why it is unavailable (None when no reason was given)."""
+    try:
+        return summarizer.summarize(segments), None
+    except SummaryUnavailable as exc:
+        return None, str(exc)
+
+
+def _write_summary(path: Path, summary: Summary | None, error: str | None) -> None:
+    payload: dict | None = None
     if summary is not None:
         payload = {"text": summary.text, "action_items": [asdict(i) for i in summary.action_items]}
+    elif error is not None:
+        payload = {"error": error}
     write_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
-def _read_summary(path: Path) -> Summary | None:
+def _read_summary(path: Path) -> tuple[Summary | None, str | None]:
+    """The summary checkpoint: a summary, or None and the reason it is unavailable."""
     data = json.loads(path.read_text(encoding="utf-8"))
     if data is None:
-        return None
-    return Summary(data["text"], tuple(ActionItem(**i) for i in data["action_items"]))
+        return None, None
+    if "error" in data:
+        return None, data["error"]
+    return Summary(data["text"], tuple(ActionItem(**i) for i in data["action_items"])), None
 
 
 def _read_timings(path: Path) -> dict[str, float]:
@@ -123,12 +136,12 @@ def process_job(
                 _write_segments(segments_path, transcriber.transcribe(prepare_for_stt(job.audio_path, work)))
                 _delete_stt_audio(work)
             elif stage == "summarize":
-                _write_summary(summary_path, summarizer.summarize(_read_segments(segments_path)))
+                _write_summary(summary_path, *_summarize(summarizer, _read_segments(segments_path)))
             elif stage == "output":
                 timings["hangup_to_output_sec"] = round((datetime.now(UTC) - _hangup(sidecar)).total_seconds(), 1)
                 # Read the checkpoints first: a missing one is a real failure, not an outage.
                 segments = _read_segments(segments_path)
-                summary = _read_summary(summary_path)
+                summary, summary_error = _read_summary(summary_path)
                 owners = owners_for(job, store)
                 try:
                     write_outputs(
@@ -136,6 +149,7 @@ def process_job(
                         sidecar=sidecar,
                         segments=segments,
                         summary=summary,
+                        summary_error=summary_error,
                         owners=owners,
                         models={"stt": cfg.stt.model, "summary": cfg.summary.model},
                         recording=job.audio_path,

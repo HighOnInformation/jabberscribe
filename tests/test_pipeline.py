@@ -122,6 +122,34 @@ def test_unavailable_summary_still_completes(cfg, store, audit, make_wav, make_s
     job = store.get(key)
     assert job.status == DONE
     assert _result(job)["summary_available"] is False
+    assert _result(job)["summary_error"] is None
+
+
+def test_degraded_summary_ships_the_transcript_and_records_why(cfg, store, audit, make_wav, make_sidecar) -> None:
+    from jabberscribe.summarize import SummaryUnavailable
+
+    class TooLong:
+        def summarize(self, segments: list[Segment]) -> Summary | None:
+            raise SummaryUnavailable("chat route rejected the request: HTTP 400")
+
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+
+    run_once(cfg, store, FakeTranscriber(), TooLong())
+
+    job = store.get(key)
+    assert (job.status, job.attempts) == (DONE, 0)
+    assert (job.out_dir / TRANSCRIPT_FILE).is_file()
+    result = _result(job)
+    assert result["summary_available"] is False
+    assert result["summary_error"] == "chat route rejected the request: HTTP 400"
+
+
+def test_a_summary_records_no_summary_error(cfg, store, audit, make_wav, make_sidecar) -> None:
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+
+    run_once(cfg, store, FakeTranscriber(), FakeSummarizer())
+
+    assert _result(store.get(key))["summary_error"] is None
 
 
 def test_resume_after_crash_does_not_retranscribe(cfg, store, audit, make_wav, make_sidecar) -> None:

@@ -11,6 +11,7 @@ from jabberscribe.summarize import (
     LiteLLMSummarizer,
     Summary,
     SummaryError,
+    SummaryUnavailable,
     chunk_segments,
     parse_summary,
     transcript_text,
@@ -91,7 +92,8 @@ def test_retries_once_after_unusable_output() -> None:
 def test_gives_up_after_two_unusable_answers_and_logs_them(caplog) -> None:
     server = Server("nope", "still nope")
 
-    assert _summarizer(server).summarize(SEGMENTS) is None
+    with pytest.raises(SummaryUnavailable, match="unusable"):
+        _summarizer(server).summarize(SEGMENTS)
     assert len(server.requests) == 2
     assert "still nope" in caplog.text
 
@@ -100,7 +102,8 @@ def test_null_content_is_unusable_output_not_a_crash() -> None:
     """A refusal or empty completion comes back as content: null."""
     server = Server(None, "")
 
-    assert _summarizer(server).summarize(SEGMENTS) is None
+    with pytest.raises(SummaryUnavailable):
+        _summarizer(server).summarize(SEGMENTS)
     assert len(server.requests) == 2
 
 
@@ -115,7 +118,17 @@ def test_unreachable_server_is_transient() -> None:
         _summarizer(Server(httpx.ConnectError("refused"))).summarize(SEGMENTS)
 
 
-@pytest.mark.parametrize("status", [400, 401, 404])
+@pytest.mark.parametrize("status", [400, 413, 422])
+def test_unprocessable_request_degrades_to_summary_unavailable(status: int) -> None:
+    """A context-length 400 is the transcript's size, not a broken setup: the transcript must still ship."""
+    server = Server(httpx.Response(status, json={"error": "maximum context length exceeded"}))
+
+    with pytest.raises(SummaryUnavailable, match=f"HTTP {status}"):
+        _summarizer(server).summarize(SEGMENTS)
+    assert len(server.requests) == 1
+
+
+@pytest.mark.parametrize("status", [401, 403, 404])
 def test_rejected_request_fails_loudly(status: int) -> None:
     """A wrong model name must not quietly ship "summary unavailable" for every call."""
     with pytest.raises(SummaryError, match=str(status)):
@@ -166,7 +179,24 @@ def test_long_transcript_is_summarized_per_chunk_then_merged() -> None:
 def test_an_unusable_chunk_makes_the_summary_unavailable() -> None:
     server = Server("nope", "still nope")
 
-    assert _summarizer(server, max_chunk_chars=40).summarize(SEGMENTS) is None
+    with pytest.raises(SummaryUnavailable):
+        _summarizer(server, max_chunk_chars=40).summarize(SEGMENTS)
+
+
+def test_merge_pass_is_bounded_by_max_chunk_chars() -> None:
+    """Six chunk summaries that do not fit one merge prompt are merged in batches that do."""
+    segments = [Segment(float(i), float(i + 1), "x" * 40) for i in range(6)]
+    parts = [json.dumps({"summary": f"חלק {i}", "action_items": []}) for i in range(6)]
+    merges = [json.dumps({"summary": text}) for text in ("איחוד 0", "איחוד 1", "סיכום סופי")]
+    server = Server(*parts, *merges)
+
+    summary = _summarizer(server, max_chunk_chars=60).summarize(segments)
+
+    assert summary == Summary("סיכום סופי", ())
+    bodies = [r["messages"][0]["content"].split("Partial summaries:\n", 1) for r in server.requests[6:]]
+    assert len(bodies) == 3
+    assert all(len(body) <= 60 for _, body in bodies)
+    assert "איחוד 0" in bodies[2][1] and "איחוד 1" in bodies[2][1]
 
 
 def test_parse_strips_code_fences() -> None:

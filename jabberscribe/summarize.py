@@ -1,19 +1,23 @@
 """Meeting summary and action items via the LiteLLM chat route.
 
 A summary failure must never cost the user their transcript. Failures split
-three ways:
+four ways:
 
 - Unusable model output (not JSON, wrong shape, empty content): retried once,
-  then the call carries on with the summary marked unavailable.
+  then SummaryUnavailable: the call carries on with the summary marked
+  unavailable and the reason recorded.
+- HTTP 400, 413 or 422 (the input itself was rejected, e.g. the context window
+  exceeded): SummaryUnavailable at once; retrying the same input cannot help.
 - LiteLLM down or overloaded: TransientError, so the job retries later with
   the transcript already checkpointed. A two-minute Gemma restart must not
   cost a summary forever.
-- Any other 4xx (wrong model name, bad key, rejected parameter): SummaryError,
-  so the job fails loudly instead of shipping "unavailable" for every call.
+- Any other 4xx (401/403 bad key, 404 wrong model name): SummaryError, so the
+  job fails loudly instead of shipping "unavailable" for every call.
 
 The instructions travel in the user message: Gemma 1 and 2 chat templates
 reject a system role. Transcripts longer than max_chunk_chars are summarized
-per chunk, then the chunk summaries are merged; action items are the union of
+per chunk, then the chunk summaries are merged, in batches that fit
+max_chunk_chars and again until one is left; action items are the union of
 the chunks' items, each keeping its own source_ts.
 """
 
@@ -37,6 +41,8 @@ ATTEMPTS = 2
 MAX_TOKENS = 2048
 #: How much of an unusable answer goes into the log.
 LOG_CHARS = 300
+#: The chat route rejected this input (too long, unprocessable): degrade, do not fail the job.
+UNPROCESSABLE_STATUSES = (400, 413, 422)
 
 INSTRUCTIONS = """You summarize Hebrew business phone calls and meetings from a timestamped transcript.
 Write in Hebrew. Keep English technical terms exactly as spoken.
@@ -56,7 +62,11 @@ Return only a JSON object with this shape:
 
 
 class SummaryError(RuntimeError):
-    """LiteLLM rejected the summary request (4xx other than 429). Retrying will not help."""
+    """LiteLLM rejected the summary request as misconfigured (401, 403, 404, ...). Retrying will not help."""
+
+
+class SummaryUnavailable(Exception):
+    """No summary for this call; it carries on with its transcript. str() is the reason, without call content."""
 
 
 @dataclass(frozen=True)
@@ -74,7 +84,9 @@ class Summary:
 
 
 class Summarizer(Protocol):
-    def summarize(self, segments: list[Segment]) -> Summary | None: ...
+    def summarize(self, segments: list[Segment]) -> Summary | None:
+        """None, or SummaryUnavailable raised: the call carries on without a summary."""
+        ...
 
 
 class _ItemModel(BaseModel):
@@ -151,6 +163,20 @@ def _parse_merge(content: str) -> str:
     return _MergeModel.model_validate_json(strip_fences(content)).summary.strip()
 
 
+def _numbered(texts: list[str]) -> str:
+    return "\n\n".join(f"Part {i}:\n{t}" for i, t in enumerate(texts, start=1))
+
+
+def _merge_batches(texts: list[str], max_chars: int) -> list[list[str]]:
+    """Consecutive batches whose numbered text fits max_chars. A batch takes at least two, so merging progresses."""
+    batches: list[list[str]] = [[]]
+    for text in texts:
+        if len(batches[-1]) >= 2 and len(_numbered([*batches[-1], text])) > max_chars:
+            batches.append([])
+        batches[-1].append(text)
+    return batches
+
+
 def _union(parts: list[Summary]) -> tuple[ActionItem, ...]:
     items: list[ActionItem] = []
     for part in parts:
@@ -165,26 +191,28 @@ class LiteLLMSummarizer:
         self._max_chunk_chars = max_chunk_chars
 
     def summarize(self, segments: list[Segment]) -> Summary | None:
-        """None means the model's output stayed unusable; transport and 4xx errors raise."""
+        """None for an empty transcript. Raises SummaryUnavailable, TransientError or SummaryError."""
         if not segments:
             return None
         chunks = chunk_segments(segments, self._max_chunk_chars)
-        parts: list[Summary] = []
-        for index, chunk in enumerate(chunks, start=1):
-            part = self._ask(INSTRUCTIONS, "Transcript:\n" + transcript_text(chunk), parse_summary)
-            if part is None:
-                log.warning("summary chunk %d/%d stayed unusable; summary unavailable", index, len(chunks))
-                return None
-            parts.append(part)
-        if len(parts) == 1:
-            return parts[0]
-        numbered = "\n\n".join(f"Part {i}:\n{p.text}" for i, p in enumerate(parts, start=1))
-        merged = self._ask(MERGE_INSTRUCTIONS, "Partial summaries:\n" + numbered, _parse_merge)
-        if merged is None:
-            return None
-        return Summary(merged, _union(parts))
+        try:
+            parts = [
+                self._ask(INSTRUCTIONS, "Transcript:\n" + transcript_text(chunk), parse_summary) for chunk in chunks
+            ]
+            texts = [p.text for p in parts]
+            while len(texts) > 1:
+                texts = [
+                    self._ask(MERGE_INSTRUCTIONS, "Partial summaries:\n" + _numbered(batch), _parse_merge)
+                    if len(batch) > 1
+                    else batch[0]
+                    for batch in _merge_batches(texts, self._max_chunk_chars)
+                ]
+        except SummaryUnavailable as exc:
+            log.warning("summary unavailable (%d chunk(s)): %s", len(chunks), exc)
+            raise
+        return parts[0] if len(parts) == 1 else Summary(texts[0], _union(parts))
 
-    def _ask[T](self, instructions: str, body: str, parse: Callable[[str], T]) -> T | None:
+    def _ask[T](self, instructions: str, body: str, parse: Callable[[str], T]) -> T:
         for attempt in range(1, ATTEMPTS + 1):
             content: str | None = None
             try:
@@ -198,7 +226,7 @@ class LiteLLMSummarizer:
                     exc,
                     (content or "")[:LOG_CHARS],
                 )
-        return None
+        raise SummaryUnavailable(f"model output stayed unusable after {ATTEMPTS} attempts")
 
     def _complete(self, prompt: str) -> str:
         """One chat completion. Raises ValueError when the answer has no text content."""
@@ -215,6 +243,9 @@ class LiteLLMSummarizer:
                 },
             )
         except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status in UNPROCESSABLE_STATUSES:
+                raise SummaryUnavailable(f"chat route rejected the request: HTTP {status}") from exc
             raise SummaryError(f"summary request rejected: {exc}") from exc
         content = response.json()["choices"][0]["message"]["content"]
         if not isinstance(content, str) or not content.strip():

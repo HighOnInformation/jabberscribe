@@ -92,6 +92,7 @@ def write_outputs(
     segments: list[Segment],
     summary: Summary | None,
     owners: list[Party],
+    summary_error: str | None = None,
     models: dict[str, str],
     recording: Path,
     timings: dict[str, float] | None = None,
@@ -99,6 +100,7 @@ def write_outputs(
     """Write every output file for one call. Returns the result.json path.
 
     `timings` holds per-stage seconds and the hang-up-to-output latency (see pipeline.py).
+    `summary_error` says why the summary is unavailable, when the reason is known.
     """
     write_atomic(out_dir / TRANSCRIPT_FILE, _render_transcript(segments))
     write_atomic(out_dir / SUMMARY_FILE, _render_summary(summary))
@@ -117,6 +119,7 @@ def write_outputs(
         "recording": recording.name,
         "transcript": [asdict(s) for s in segments],
         "summary_available": summary is not None,
+        "summary_error": None if summary is not None else summary_error,
         "summary": summary.text if summary else None,
         "action_items": [asdict(i) for i in summary.action_items] if summary else [],
         "models": models,
