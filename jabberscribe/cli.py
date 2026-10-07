@@ -261,7 +261,7 @@ def _process(cfg: Config, store: JobStore, audit: AuditLog, audio: Path, sidecar
 
 def _alert_purge(alerter: Alerter | None, errors: tuple[str, ...]) -> None:
     if alerter is not None and errors:
-        alerter.send(PURGE_ERRORS, f"{len(errors)} purge problem(s); first: {errors[0]}", _utcnow())
+        alerter.send(PURGE_ERRORS, f"{len(errors)} purge problem(s); see service log", _utcnow())
 
 
 def _report_purge(cfg: Config, store: JobStore, audit: AuditLog) -> int:

@@ -1,4 +1,5 @@
 import json
+import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -114,7 +115,7 @@ def test_an_undelivered_alert_is_tried_again(tmp_path: Path) -> None:
 
     assert alerter.send(BACKLOG, "a", T0) is False
     hook.status = 200
-    assert alerter.send(BACKLOG, "a", T0 + timedelta(minutes=1)) is True
+    assert alerter.send(BACKLOG, "a", T0 + timedelta(minutes=6)) is True
 
 
 def test_an_unreachable_webhook_never_raises(tmp_path: Path) -> None:
@@ -242,7 +243,8 @@ def test_purge_command_alerts_on_errors(cfg_file, tmp_path: Path, monkeypatch) -
     assert cli.main(["--config", str(cfg_file), "purge"]) == 1
 
     assert hook.kinds == [PURGE_ERRORS]
-    assert "k_1: cannot delete audio" in hook.posts[0]["message"]
+    assert hook.posts[0]["message"] == "1 purge problem(s); see service log"
+    assert "cannot delete" not in json.dumps(hook.posts[0])
 
 
 def test_doctor_alerts_when_litellm_checks_fail(cfg_file, tmp_path: Path, monkeypatch) -> None:
@@ -262,3 +264,81 @@ def test_doctor_alerts_when_litellm_checks_fail(cfg_file, tmp_path: Path, monkey
 
     assert hook.kinds == [LITELLM_DOWN]
     assert hook.posts[0]["message"].startswith("doctor: litellm:")
+
+
+def test_a_malformed_url_never_raises(tmp_path: Path) -> None:
+    client = httpx.Client(transport=httpx.MockTransport(Hook()))
+
+    assert Alerter("http://a:b:c/", tmp_path / "alerts.json", client).send(BACKLOG, "a", T0) is False
+
+
+def test_corrupt_state_values_are_ignored(tmp_path: Path) -> None:
+    for sent in ({"backlog": "garbage"}, {"backlog": "2026-10-07T12:00:00"}, {"backlog": 5}, {"backlog": None}):
+        hook = Hook()
+        path = tmp_path / "alerts.json"
+        path.write_text(json.dumps({"sent": sent, "failed_backoff": {"backlog": "garbage"}}), encoding="utf-8")
+        alerter = Alerter("http://hooks.test/alert", path, httpx.Client(transport=httpx.MockTransport(hook)))
+
+        assert alerter.send(BACKLOG, "a", T0) is True
+
+
+def test_an_unwritable_state_file_never_raises(tmp_path: Path) -> None:
+    blocker = tmp_path / "file"
+    blocker.write_text("x", encoding="utf-8")
+    hook = Hook()
+    client = httpx.Client(transport=httpx.MockTransport(hook))
+
+    assert Alerter("http://hooks.test/alert", blocker / "alerts.json", client).send(BACKLOG, "a", T0) is True
+
+
+def test_the_webhook_url_is_never_logged(tmp_path: Path, caplog) -> None:
+    hook = Hook(status=500)
+    client = httpx.Client(transport=httpx.MockTransport(hook))
+    alerter = Alerter("http://hooks.test/services/T0/SECRETPATH", tmp_path / "alerts.json", client)
+
+    with caplog.at_level(logging.DEBUG):
+        alerter.send(BACKLOG, "a", T0)
+
+    assert "500" in caplog.text
+    assert "SECRETPATH" not in caplog.text
+    assert "hooks.test" not in caplog.text
+
+
+def test_a_failed_delivery_backs_off_for_five_minutes(tmp_path: Path) -> None:
+    hook = Hook(status=500)
+    alerter = _alerter(tmp_path, hook)
+
+    assert alerter.send(BACKLOG, "a", T0) is False
+    hook.status = 200
+    assert alerter.send(BACKLOG, "a", T0 + timedelta(minutes=4)) is False
+    assert len(hook.posts) == 1
+    assert alerter.send(BACKLOG, "a", T0 + timedelta(minutes=6)) is True
+    assert _alerter(tmp_path, hook).send(BACKLOG, "a", T0 + timedelta(minutes=7)) is False
+
+
+def test_the_backoff_survives_a_restart(tmp_path: Path) -> None:
+    hook = Hook(status=500)
+    _alerter(tmp_path, hook).send(BACKLOG, "a", T0)
+
+    assert _alerter(tmp_path, hook).send(BACKLOG, "a", T0 + timedelta(minutes=1)) is False
+    assert len(hook.posts) == 1
+
+
+def test_purge_and_doctor_survive_a_dead_webhook(cfg_file, tmp_path: Path, monkeypatch, capsys) -> None:
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    dead = httpx.Client(transport=httpx.MockTransport(refuse))
+    monkeypatch.setattr(cli, "make_alerter", lambda cfg: Alerter("http://a:b:c/", tmp_path / "alerts.json", dead))
+    monkeypatch.setattr(cli, "purge", lambda *args, **kwargs: PurgeResult(errors=("k_1: cannot delete audio",)))
+
+    assert cli.main(["--config", str(cfg_file), "purge"]) == 1
+    assert capsys.readouterr().out.strip()
+
+    monkeypatch.setattr(
+        cli,
+        "make_client",
+        lambda litellm_cfg: httpx.Client(base_url="http://litellm.test", transport=httpx.MockTransport(refuse)),
+    )
+    assert cli.main(["--config", str(cfg_file), "doctor"]) == 1
+    assert "[FAIL] litellm" in capsys.readouterr().out

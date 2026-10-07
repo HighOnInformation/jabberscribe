@@ -22,6 +22,8 @@ import json
 import logging
 import os
 import socket
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -37,6 +39,8 @@ URL_ENV = "JABBERSCRIBE_ALERT_WEBHOOK_URL"
 TOKEN_ENV = "JABBERSCRIBE_ALERT_TOKEN"
 STATE_FILE = "alerts.json"
 RATE_LIMIT = timedelta(hours=1)
+#: After a failed delivery a kind is not retried for this long, so a dead webhook costs one timeout, not one per poll.
+BACKOFF = timedelta(minutes=5)
 TIMEOUT_SECONDS = 10.0
 #: How many job keys one alert lists; the rest are counted.
 MAX_KEYS = 5
@@ -47,6 +51,40 @@ LITELLM_DOWN = "litellm_down"
 PURGE_ERRORS = "purge_errors"
 
 
+class _DropAll(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return False
+
+
+@contextmanager
+def _httpx_silenced() -> Iterator[None]:
+    """httpx logs every request line with its full URL; the webhook URL may embed a secret, so mute it during a send."""
+    httpx_log = logging.getLogger("httpx")
+    mute = _DropAll()
+    httpx_log.addFilter(mute)
+    try:
+        yield
+    finally:
+        httpx_log.removeFilter(mute)
+
+
+def _parse_time(value: object) -> datetime | None:
+    """A timezone-aware ISO timestamp, or None for anything else (corrupt state must not raise)."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _times(raw: object) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if isinstance(k, str) and _parse_time(v) is not None}
+
+
 def _load_state(path: Path) -> dict:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -54,8 +92,12 @@ def _load_state(path: Path) -> dict:
         data = {}
     if not isinstance(data, dict):
         data = {}
-    sent, seen = data.get("sent"), data.get("failed_seen")
-    return {"sent": sent if isinstance(sent, dict) else {}, "failed_seen": seen if isinstance(seen, list) else []}
+    seen = data.get("failed_seen")
+    return {
+        "sent": _times(data.get("sent")),
+        "failed_backoff": _times(data.get("failed_backoff")),
+        "failed_seen": [k for k in seen if isinstance(k, str)] if isinstance(seen, list) else [],
+    }
 
 
 class Alerter:
@@ -69,10 +111,21 @@ class Alerter:
         self._state = _load_state(state_path)
 
     def send(self, kind: str, message: str, now: datetime) -> bool:
-        """POST one alert unless `kind` went out within the last hour. True only when it was delivered."""
-        last = self._state["sent"].get(kind)
-        if last is not None and now - datetime.fromisoformat(last) < RATE_LIMIT:
+        """POST one alert unless `kind` went out within the last hour. True only when it was delivered. Never raises."""
+        try:
+            return self._send(kind, message, now)
+        except Exception as exc:
+            log.error("alert %s not delivered (%s)", kind, type(exc).__name__)
+            return False
+
+    def _send(self, kind: str, message: str, now: datetime) -> bool:
+        last = _parse_time(self._state["sent"].get(kind))
+        if last is not None and now - last < RATE_LIMIT:
             log.info("alert %s suppressed by the rate limit: %s", kind, message)
+            return False
+        failed = _parse_time(self._state["failed_backoff"].get(kind))
+        if failed is not None and now - failed < BACKOFF:
+            log.info("alert %s held back after a failed delivery: %s", kind, message)
             return False
         payload = {
             "text": f"JabberScribe {kind}: {message}",
@@ -83,11 +136,17 @@ class Alerter:
             "at": iso(now),
         }
         try:
-            response = self._client.post(self._url, json=payload, headers=self._headers)
+            with _httpx_silenced():
+                response = self._client.post(self._url, json=payload, headers=self._headers)
             response.raise_for_status()
-        except httpx.HTTPError as exc:
-            log.error("alert %s not delivered (%s): %s", kind, exc, message)
+        except Exception as exc:
+            # Never log the exception text or URL: webhook URLs often embed a secret.
+            reason = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
+            log.error("alert %s not delivered (%s): %s", kind, reason, message)
+            self._state["failed_backoff"][kind] = iso(now)
+            self._save()
             return False
+        self._state["failed_backoff"].pop(kind, None)
         self._state["sent"][kind] = iso(now)
         self._save()
         log.warning("alert %s sent: %s", kind, message)
