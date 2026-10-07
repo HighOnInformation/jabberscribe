@@ -1,14 +1,18 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from jabberscribe.output import (
     ACTIONS_FILE,
+    REPLACE_ATTEMPTS,
     RESULT_FILE,
     SUMMARY_FILE,
     SUMMARY_UNAVAILABLE,
     TEXT_FILES,
     TRANSCRIPT_FILE,
     update_owners,
+    write_atomic,
     write_outputs,
 )
 from jabberscribe.sidecar import Party, parse_sidecar
@@ -105,3 +109,65 @@ def test_update_owners_rewrites_only_owners(tmp_path: Path, make_sidecar) -> Non
     after = json.loads(_read(out / RESULT_FILE))
     assert [o["extension"] for o in after["owners"]] == ["1042", "3000"]
     assert {k: v for k, v in after.items() if k != "owners"} == {k: v for k, v in before.items() if k != "owners"}
+
+
+def test_markdown_bodies_are_right_to_left(tmp_path: Path, make_sidecar) -> None:
+    out = _write(tmp_path, make_sidecar)
+
+    for name in (TRANSCRIPT_FILE, SUMMARY_FILE, ACTIONS_FILE):
+        text = _read(out / name)
+        assert text.startswith('<div dir="rtl">\n\n#')
+        assert text.endswith("</div>\n")
+
+
+def test_timings_are_recorded(tmp_path: Path, make_sidecar) -> None:
+    sidecar = parse_sidecar(make_sidecar(tmp_path / "s.json", call_id="gc1").read_text(encoding="utf-8"))
+    timings = {"audio_sec": 1.5, "stt_sec": 20.0, "summarize_sec": 4.0, "hangup_to_output_sec": 95.0}
+
+    path = write_outputs(
+        tmp_path / "out",
+        sidecar=sidecar,
+        segments=SEGMENTS,
+        summary=SUMMARY,
+        owners=[sidecar.line_owner],
+        models=MODELS,
+        recording=tmp_path / "out" / "recording.wav",
+        timings=timings,
+    )
+
+    assert json.loads(_read(path))["timings"] == timings
+
+
+def test_write_atomic_retries_while_a_reader_holds_the_file(tmp_path: Path, monkeypatch) -> None:
+    real_replace = Path.replace
+    failures = iter([PermissionError("in use"), PermissionError("in use")])
+
+    def flaky_replace(self: Path, target: Path) -> Path:
+        error = next(failures, None)
+        if error is not None:
+            raise error
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", flaky_replace)
+    monkeypatch.setattr("jabberscribe.output.time.sleep", lambda seconds: None)
+
+    write_atomic(tmp_path / "result.json", "{}")
+
+    assert _read(tmp_path / "result.json") == "{}"
+
+
+def test_write_atomic_gives_up_and_cleans_up(tmp_path: Path, monkeypatch) -> None:
+    calls: list[Path] = []
+
+    def locked(self: Path, target: Path) -> Path:
+        calls.append(target)
+        raise PermissionError("in use")
+
+    monkeypatch.setattr(Path, "replace", locked)
+    monkeypatch.setattr("jabberscribe.output.time.sleep", lambda seconds: None)
+
+    with pytest.raises(PermissionError):
+        write_atomic(tmp_path / "result.json", "{}")
+
+    assert len(calls) == REPLACE_ATTEMPTS
+    assert list(tmp_path.iterdir()) == []
