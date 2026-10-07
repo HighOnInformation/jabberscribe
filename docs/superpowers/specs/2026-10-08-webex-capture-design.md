@@ -46,11 +46,11 @@ fails is retried on the next poll until it succeeds, is parked, or ages out of t
 
 | Use | Request | Status |
 |---|---|---|
-| List (admin/compliance) | `GET /v1/admin/convergedRecordings?from=&to=&status=available&max=` | [P] path and params from reference-page snippet + SDK |
+| List (admin/compliance) | `GET /v1/admin/convergedRecordings?from=&to=&status=available&serviceType=calling&max=` | [P] path and params from reference-page snippet + SDK |
 | Window limit | `to - from` ≤ 30 days | [P] |
 | Paging | RFC 5988 `Link: <…>; rel="next"` | [P] standard Webex paging |
 | Details | `GET /v1/convergedRecordings/{id}` → `temporaryDirectDownloadLinks.audioDownloadLink` (expires 3 h) | [V] existence; [U] admin path and field name |
-| Metadata | `GET /v1/convergedRecordings/{id}/metadata?showAllTypes=true` → `ownerName`, participants | [V] existence; [U] admin path and fields |
+| Metadata | `GET /v1/convergedRecordings/{id}/metadata?showAllTypes=true` → `ownerName`, participants, and (assumed) `serviceData` calling/called party, `personality`, session start | [V] existence; [U] admin path and fields |
 | Hard delete | `DELETE /v1/convergedRecordings/{id}` with `reasonForDeletion`, `comment` | [V] compliance-only; [U] exact path/body |
 | Audio | MP3 | [V] Cisco TAC |
 
@@ -61,6 +61,9 @@ Sources:
 - https://www.cisco.com/c/en/us/support/docs/unified-communications/webex-calling/222147-download-call-recordings-through-api-wit.html
 - https://github.com/CiscoSE/WebexCallingRecordingsDownloader
 - https://help.webex.com/en-us/article/6xorz3/Enable-call-recording-for-an-organization
+
+The HTTP client's own INFO logging is silenced (`httpx`, `httpcore` at WARNING) because it
+prints full temporary download URLs.
 
 Every unverified path and field name is isolated in one small function or constant in
 `jabberscribe/capture/webex.py`, each with an `ASSUMPTION` comment.
@@ -86,9 +89,9 @@ Imagicle, CallCabinet etc. keep audio in their own cloud and would need their ow
 | Sidecar field | Source | Rule |
 |---|---|---|
 | `schema_version` | const | `2` |
-| `call_id` | `serviceData.callSessionId`, else `serviceData.callId`, else recording `id` | Prefixed `wxc-`. Both ends of an internal call share it; the dedup key `(call_id, extension)` separates them. |
-| `conference_id` | `callSessionId` | Set (as `wxc-<session>`) when more than one recording in the same listing shares the session, or metadata lists more than 2 participants [U]. Null for 1:1. |
-| `line_owner.extension` | `calledParty.number` if `personality` is terminating, else `callingParty.number` | Fallback: `ownerEmail` local part, so the pair is not quarantined. |
+| `call_id` | `serviceData.callSessionId`, else `serviceData.callId`, else recording `id` | Prefixed `wxc-`. Both ends of an internal call share it; the dedup key `(call_id, extension)` separates them, so each line owner gets their own copy (spec v2 §6). |
+| `conference_id` | `callSessionId` | Set (as `wxc-<session>`) only on positive evidence: metadata lists more than 2 participants, or the listing shows more than 2 distinct recording owners for the session [U]. Two legs sharing a session are the two ends of a 1:1 call and are **not** a conference. Null otherwise. |
+| `line_owner.extension` | `calledParty.number` if `personality` is terminating, else `callingParty.number`. Party, personality and session start are read from the metadata response first, then details/list [U] | Fallback: `ownerEmail` local part, so the pair is not quarantined. |
 | `line_owner.user` | `ownerEmail` local part | Must equal the SSO identity (open question 7). |
 | `line_owner.display_name` | metadata `ownerName`, else the owner party's `name` | |
 | `parties[]` | the other party (`number` → extension, `name` → display_name) | Conference participant lists not mapped yet [U]. |
@@ -106,13 +109,16 @@ File name base: `jabberscribe.sidecar.job_key(call_id, extension)`.
 | Failure | Behaviour |
 |---|---|
 | 401/403 on list | Poll aborts with an error log; nothing is written. |
-| 429 / 5xx / network error | Transient: the poll stops, nothing counts against the recording, next poll retries. `Retry-After` is not honoured beyond the poll interval. |
-| Other 4xx on one recording, empty link, ffprobe/ffmpeg failure | Recording's attempt count increments; retried next poll; parked after `max_attempts` (default 5). |
+| 429 / network error | Transient: the poll stops, nothing counts against the recording, next poll retries. `Retry-After` is not honoured beyond the poll interval. |
+| 4xx or 5xx on one recording, empty link, ffprobe/ffmpeg failure, malformed recording (bad time, missing field) | Recording's attempt count increments, the poll continues with the next recording; retried next poll; parked after `max_attempts` (default 5). |
+| Unexpected error in a poll | Logged by class name only (no URLs); the daemon keeps polling. |
 | Crash mid-export | Only `.part` files or the work-dir MP3 remain; they are overwritten on retry. The watcher ignores `.part` files and a `.wav` without a `.json`. |
 | Any error before the sidecar rename | No `.json` appears, so the watcher never sees a partial pair; leftover `.wav.part` is removed. |
 | Metadata 403/404 | Degrades to no metadata (display name from the party, no participant count); export continues. |
 | Delete fails after export | Logged; the export stands and is not retried. |
-| Late conference leg (arrives in a later poll) | Gets `conference_id` only if metadata reports >2 participants; otherwise exported as a call (open question 5). |
+| Late conference leg (arrives in a later poll) | Gets `conference_id` only if metadata reports >2 participants or the listing shows >2 owners; otherwise exported as a call (open question 5). |
+| Download redirect | Followed; httpx drops the bearer header on a cross-origin redirect. |
+| Crash between pair write and ledger mark | The recording is exported again under the same `job_key`; the watcher discards it as a duplicate. |
 
 ## 6. Configuration
 
@@ -140,5 +146,10 @@ model with `extra="forbid"`. The main `jabberscribe/config.py` is untouched.
 9. Does the temporary download link need the bearer token when it is on a different host? [U]
 10. Rate limits and the delay between hang-up and recording availability. [U]
 11. Data residency of the tenant's `storageRegion` and acceptance of the egress.
-12. `line_owner.extension` when Webex only reports E.164 numbers: is that acceptable as the
+12. Where do `callingParty`, `calledParty`, `personality` and the session start live: the list
+    item, the details response, or `GET .../metadata`? The exporter reads metadata first and
+    falls back to details/list (`_with_metadata_call_fields`). [U]
+13. A failed delete-after-export is logged and **not retried**, so the Webex copy stays. Needs a
+    decision: retry on later polls, or accept and sweep by retention policy.
+14. `line_owner.extension` when Webex only reports E.164 numbers: is that acceptable as the
     "extension", or must we enrich from the People / Calling user API (more scopes)?
