@@ -1,7 +1,7 @@
 # JabberScribe v2 — Technical Specification
 
 **Date:** 2026-10-07
-**Status:** Agreed in a grilling session; not yet planned or implemented.
+**Status:** Agreed in a grilling session; MVP pipeline implemented on `feat/v2-pipeline` (capture/SIPREC recorder not built). Deviations awaiting owner sign-off are marked in §6.
 **Supersedes:** [2026-08-12-jabberscribe-design.md](2026-08-12-jabberscribe-design.md)
 
 ---
