@@ -1,7 +1,9 @@
 import json
+from pathlib import Path
 
 import pytest
 
+import jabberscribe.sidecar as sidecar_module
 from jabberscribe.sidecar import SidecarError, job_key, parse_sidecar
 
 
@@ -59,7 +61,7 @@ def test_conference_id_is_parsed() -> None:
 
 
 def test_leading_bom_is_tolerated() -> None:
-    assert parse_sidecar("﻿" + _doc()).call_id == "gcid-1"
+    assert parse_sidecar("\N{BYTE ORDER MARK}" + _doc()).call_id == "gcid-1"
 
 
 def test_unknown_fields_are_ignored() -> None:
@@ -106,3 +108,32 @@ def test_rejects_non_object() -> None:
 def test_rejects_malformed(overrides: dict, fragment: str) -> None:
     with pytest.raises(SidecarError, match=fragment):
         parse_sidecar(_doc(**overrides))
+
+
+@pytest.mark.parametrize("version", [None, 1, 3, "2"])
+def test_rejects_other_schema_versions(version: object) -> None:
+    with pytest.raises(SidecarError, match="schema_version"):
+        parse_sidecar(_doc(schema_version=version))
+
+
+def test_rejects_started_at_without_offset() -> None:
+    with pytest.raises(SidecarError, match="UTC offset"):
+        parse_sidecar(_doc(started_at="2026-10-07T14:03:11"))
+
+
+def test_extension_is_stripped() -> None:
+    sidecar = parse_sidecar(_doc(line_owner={"extension": " 1042 ", "user": "meir"}))
+
+    assert sidecar.line_owner.extension == "1042"
+    assert sidecar.job_key == "gcid-1_1042"
+
+
+def test_missing_user_is_accepted_with_a_warning(caplog) -> None:
+    sidecar = parse_sidecar(_doc(line_owner={"extension": "1042"}))
+
+    assert sidecar.line_owner.user is None
+    assert "line_owner.user" in caplog.text
+
+
+def test_source_has_no_literal_bom() -> None:
+    assert "\N{BYTE ORDER MARK}" not in Path(sidecar_module.__file__).read_text(encoding="utf-8")

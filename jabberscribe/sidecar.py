@@ -8,10 +8,14 @@ pipeline cannot work without. Everything else degrades.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime
 
+log = logging.getLogger(__name__)
+
+SCHEMA_VERSION = 2
 VALID_TRACKS = ("dual", "mixed")
 VALID_KINDS = ("call", "conference")
 
@@ -92,24 +96,34 @@ def parse_sidecar(text: str) -> Sidecar:
     # Strip a leading BOM. PowerShell, .NET, and Notepad all emit UTF-8 with a
     # BOM by default, so a recorder written in any of them would otherwise have
     # every one of its sidecars rejected.
-    text = text.lstrip("﻿")
+    text = text.lstrip("\N{BYTE ORDER MARK}")
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
         raise SidecarError(f"sidecar is not valid JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise SidecarError("sidecar must be a JSON object")
+    if data.get("schema_version") != SCHEMA_VERSION:
+        raise SidecarError(f"schema_version must be {SCHEMA_VERSION}, got {data.get('schema_version')!r}")
 
     call_id = _require_nonempty_str(data, "call_id")
     started_at = _require_nonempty_str(data, "started_at")
     try:
-        datetime.fromisoformat(started_at)
+        started = datetime.fromisoformat(started_at)
     except ValueError as exc:
         raise SidecarError(f"started_at must be an ISO 8601 timestamp, got {started_at!r}") from exc
+    if started.tzinfo is None:
+        # Grouping and retention compare timestamps; naive and aware values cannot be compared.
+        raise SidecarError(f"started_at must carry a UTC offset, got {started_at!r}")
 
     line_owner = _parse_party(data.get("line_owner"), "line_owner")
-    if not line_owner.extension or not line_owner.extension.strip():
+    extension = (line_owner.extension or "").strip()
+    if not extension:
         raise SidecarError("line_owner.extension is required and must be a non-empty string")
+    # " 1042" and "1042" are one line: they must give one job key and one owner.
+    line_owner = Party(extension=extension, user=line_owner.user, display_name=line_owner.display_name)
+    if not line_owner.user:
+        log.warning("sidecar for call %s has no line_owner.user; the web app cannot attribute it", call_id)
 
     conference_id = data.get("conference_id")
     if conference_id is not None and (not isinstance(conference_id, str) or not conference_id.strip()):
