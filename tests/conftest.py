@@ -15,7 +15,9 @@ from pathlib import Path
 
 import pytest
 
+from jabberscribe.audit import AuditLog
 from jabberscribe.config import Config
+from jabberscribe.jobs import JobStore
 
 
 @pytest.fixture
@@ -36,6 +38,20 @@ def cfg(tmp_path: Path) -> Config:
     config.paths.quarantine.mkdir(parents=True)
     config.paths.work_dir.mkdir(parents=True)
     return config
+
+
+@pytest.fixture
+def store(cfg: Config) -> JobStore:
+    job_store = JobStore(cfg.paths.db_path)
+    job_store.init_schema()
+    return job_store
+
+
+@pytest.fixture
+def audit(cfg: Config) -> AuditLog:
+    log = AuditLog(cfg.paths.db_path, actor="test")
+    log.init_schema()
+    return log
 
 
 @pytest.fixture

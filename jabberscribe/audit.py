@@ -1,8 +1,11 @@
 """Append-only audit trail.
 
-A record-everything recording policy guarantees somebody will eventually ask who
-saw a given call. That answer has to exist, so every publish, mail, and deletion
-writes a row here. Rows are never updated or deleted.
+A record-everything recording policy guarantees somebody will eventually ask
+what happened to a given call. That answer has to exist, so every deletion and
+every quarantine writes a row here. Rows are never updated or deleted.
+
+`job_key` names the call when there is one. For files that never became a job
+(quarantined pairs, inbox orphans) it is the file name.
 """
 
 from __future__ import annotations
@@ -13,30 +16,33 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-PUBLISHED = "published"
-UPDATED = "updated"
-MAILED = "mailed"
-PURGED_AUDIO = "purged_audio"
-PURGED_PAGE = "purged_page"
 QUARANTINED = "quarantined"
+DISCARDED_DUPLICATE = "discarded_duplicate"
+SUPERSEDED = "superseded"
+PURGED_AUDIO = "purged_audio"
+PURGED_TEXT = "purged_text"
+PURGED_STT_AUDIO = "purged_stt_audio"
+PURGED_QUARANTINE = "purged_quarantine"
+PURGED_ORPHAN = "purged_orphan"
+SCRUBBED_METADATA = "scrubbed_metadata"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS audit_log (
   id      INTEGER PRIMARY KEY AUTOINCREMENT,
-  call_id TEXT NOT NULL,
+  job_key TEXT NOT NULL,
   action  TEXT NOT NULL,
   detail  TEXT,
   actor   TEXT NOT NULL,
   at      TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_audit_call ON audit_log (call_id, id);
+CREATE INDEX IF NOT EXISTS idx_audit_job ON audit_log (job_key, id);
 """
 
 
 @dataclass(frozen=True)
 class AuditEntry:
-    call_id: str
+    job_key: str
     action: str
     detail: str
     actor: str
@@ -64,15 +70,15 @@ class AuditLog:
     def init_schema(self) -> None:
         self._conn.executescript(_SCHEMA)
 
-    def record(self, call_id: str, action: str, detail: str = "") -> None:
+    def record(self, job_key: str, action: str, detail: str = "") -> None:
         self._conn.execute(
-            "INSERT INTO audit_log (call_id, action, detail, actor, at) VALUES (?, ?, ?, ?, ?)",
-            (call_id, action, detail, self._actor, datetime.now(UTC).isoformat(timespec="seconds")),
+            "INSERT INTO audit_log (job_key, action, detail, actor, at) VALUES (?, ?, ?, ?, ?)",
+            (job_key, action, detail, self._actor, datetime.now(UTC).isoformat(timespec="seconds")),
         )
 
-    def entries(self, call_id: str | None = None) -> list[AuditEntry]:
-        if call_id is None:
+    def entries(self, job_key: str | None = None) -> list[AuditEntry]:
+        if job_key is None:
             rows = self._conn.execute("SELECT * FROM audit_log ORDER BY id").fetchall()
         else:
-            rows = self._conn.execute("SELECT * FROM audit_log WHERE call_id = ? ORDER BY id", (call_id,)).fetchall()
-        return [AuditEntry(r["call_id"], r["action"], r["detail"] or "", r["actor"], r["at"]) for r in rows]
+            rows = self._conn.execute("SELECT * FROM audit_log WHERE job_key = ? ORDER BY id", (job_key,)).fetchall()
+        return [AuditEntry(r["job_key"], r["action"], r["detail"] or "", r["actor"], r["at"]) for r in rows]
