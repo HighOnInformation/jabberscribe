@@ -1,0 +1,23 @@
+# Webex Calling exporter (python -m jabberscribe.capture.webex --config config/webex.yaml).
+# Copy to config/webex.yaml. The token comes from JABBERSCRIBE_WEBEX_TOKEN, never here.
+
+# Must be the watcher's inbox: drop_root/inbox from config/jabberscribe.yaml.
+inbox: D:/jabberscribe/drop/inbox
+# The exporter's own ledger of exported recordings. Not the jobs database.
+state_path: D:/jabberscribe/webex/webex-state.db
+# Scratch space for downloaded MP3s. Must not be the inbox.
+work_dir: D:/jabberscribe/webex/work
+
+base_url: https://webexapis.com/v1
+poll_seconds: 60
+# Each poll lists recordings created this many hours back (max 720 = the API's 30-day window).
+lookback_hours: 48
+page_size: 100
+# A recording that fails this many times is parked and logged instead of retried forever.
+max_attempts: 5
+# Remove the Webex copy after export. Compliance decision; needs spark-compliance:recordings_write.
+delete_after_export: false
+
+ffmpeg: ffmpeg
+ffprobe: ffprobe
+timeout_seconds: 60

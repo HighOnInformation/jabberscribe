@@ -115,3 +115,25 @@ and [the hardened plan](docs/superpowers/plans/2026-10-08-v2-hardened-tasks.md) 
 
 Hebrew-primary audio with mixed-in English technical terms. User-facing output
 is Hebrew (RTL); code, comments, commits, logs and CLI output are English.
+
+## Capture: Webex Calling
+
+For organizations on multitenant Webex Calling (cloud), there is no on-prem media to
+fork: Jabber does not register to Webex Calling, the client is the Webex App, and calls
+are recorded in the Webex cloud. An optional exporter polls the Converged Recordings API
+and turns each new native Webex recording into a normal drop pair in the inbox, so the
+rest of the pipeline is unchanged.
+
+```bash
+cp config/webex.yaml.example config/webex.yaml   # set inbox, state_path, work_dir
+export JABBERSCRIBE_WEBEX_TOKEN=...              # compliance officer / admin token
+python -m jabberscribe.capture.webex --config config/webex.yaml --once   # one poll
+python -m jabberscribe.capture.webex --config config/webex.yaml          # keep polling
+```
+
+It needs ffmpeg/ffprobe (MP3 is converted to WAV, channel layout kept) and a token with
+`spark-compliance:recordings_read` (plus `spark-compliance:recordings_write` only if
+`delete_after_export` is on; it is off by default). It covers only the native Webex
+recording provider, and several API details are still unverified against a real
+tenant. See [the Webex capture spec](docs/superpowers/specs/2026-10-08-webex-capture-design.md)
+for the field mapping and open questions.

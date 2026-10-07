@@ -90,6 +90,11 @@ def test_config_rejects_unknown_keys_and_oversized_lookback(tmp_path: Path) -> N
         WebexConfig(**base, lookback_hours=24 * 31)
 
 
+def test_example_config_is_valid() -> None:
+    example = Path(__file__).resolve().parents[1] / "config" / "webex.yaml.example"
+    assert load_webex_config(example).delete_after_export is False
+
+
 def test_config_missing_file_raises(tmp_path: Path) -> None:
     with pytest.raises(WebexConfigError):
         load_webex_config(tmp_path / "nope.yaml")
