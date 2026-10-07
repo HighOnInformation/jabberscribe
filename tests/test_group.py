@@ -662,3 +662,66 @@ def test_live_primary_beats_a_shorter_member_of_a_failed_primary(cfg, store, aud
     assert (store.get(failed).status, store.get(failed).grouped_into) == (FAILED, primary)
     assert (store.get(member).status, store.get(member).grouped_into) == (GROUPED, primary)
     assert _owners(store, primary) == ["1042", "4000", "5000", "3000"]
+
+
+def _three_copies(cfg, store, audit, make_wav, make_sidecar) -> tuple[str, str, str]:
+    longest = _drop(cfg, store, audit, make_wav, make_sidecar, "a", "1042", duration_sec=300)
+    second = _drop(cfg, store, audit, make_wav, make_sidecar, "b", "2210", duration_sec=200)
+    third = _drop(cfg, store, audit, make_wav, make_sidecar, "c", "3000", duration_sec=100)
+    _release(cfg, store, audit, longest, second, third)
+    return longest, second, third
+
+
+def test_summary_failure_keeps_the_primary_and_its_members(cfg, store, audit, make_wav, make_sidecar) -> None:
+    """A 4xx in summarize would fail every copy alike: no re-election, the group waits for retry."""
+    longest, second, third = _three_copies(cfg, store, audit, make_wav, make_sidecar)
+    for stage in ("audio", "stt"):
+        store.complete_stage(longest, stage)
+    store.set_status(longest, FAILED)
+
+    assert _settle(cfg, store, audit) == SettleResult()
+    assert (store.get(longest).status, store.get(longest).grouped_into) == (FAILED, None)
+    assert {m.job_key for m in store.members(longest)} == {second, third}
+    assert store.conference_ids_to_settle() == []
+
+
+def test_late_copy_joins_a_primary_that_failed_in_summarize(cfg, store, audit, make_wav, make_sidecar) -> None:
+    primary = _drop(cfg, store, audit, make_wav, make_sidecar, "a", "1042", duration_sec=300)
+    _release(cfg, store, audit, primary)
+    for stage in ("audio", "stt", "summarize"):
+        store.complete_stage(primary, stage)
+    store.set_status(primary, FAILED)
+
+    late = _drop(cfg, store, audit, make_wav, make_sidecar, "b", "2210", duration_sec=100)
+    result = _settle(cfg, store, audit)
+
+    assert (result.attached, result.superseded, result.released) == ((late,), (), ())
+    assert store.get(late).grouped_into == primary
+    assert store.get(primary).status == FAILED
+
+
+def test_retry_after_a_failed_chain_restarts_from_the_longest_copy(cfg, store, audit, make_wav, make_sidecar) -> None:
+    longest, second, third = _three_copies(cfg, store, audit, make_wav, make_sidecar)
+    for failing in (longest, second, third):
+        # Each copy fails in the audio stage, as on a share outage, and hands the conference on.
+        store.set_status(failing, FAILED)
+        _settle(cfg, store, audit)
+    assert (store.get(third).status, store.get(third).grouped_into) == (FAILED, None)
+
+    assert group.requeue_failed(store, second) == longest
+
+    assert store.get(longest).status == QUEUED
+    assert (store.get(longest).stage, store.get(longest).grouped_into) == (QUEUED, None)
+    assert {m.job_key for m in store.members(longest)} == {second, third}
+    assert {store.get(k).status for k in (second, third)} == {FAILED}
+    assert group.requeue_failed(store, longest) is None
+
+
+def test_requeue_failed_refuses_a_copy_whose_primary_is_done(cfg, store, audit, make_wav, make_sidecar) -> None:
+    longest, second, _ = _three_copies(cfg, store, audit, make_wav, make_sidecar)
+    store.set_status(longest, FAILED)
+    _settle(cfg, store, audit)
+    store.set_status(second, DONE)
+
+    assert group.requeue_failed(store, longest) is None
+    assert store.get(longest).status == FAILED

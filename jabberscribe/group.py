@@ -22,8 +22,13 @@ merges them into one group under the longest; the others are superseded the
 same way. Outputs are discarded before the database changes, so a file held
 open only delays the change to the next poll.
 
-A FAILED primary never keeps its conference: the next-longest copy is elected,
-or it is handed to the winner of a merge that bridges it.
+A primary that failed on its own recording (in the audio or STT stage) does not
+keep its conference: the next-longest copy is elected, or it is handed to the
+winner of a merge that bridges it. A failure in summarize or output is the
+system's, not the copy's (a rejected key, a wrong model name): every copy would
+fail the same way, so the primary stays FAILED with its members, for
+`jabberscribe retry` once the cause is fixed. Retrying a conference whose
+failed chain was handed over restarts it from its longest failed copy.
 """
 
 from __future__ import annotations
@@ -35,7 +40,7 @@ from datetime import datetime, timedelta
 
 from jabberscribe.audit import SUPERSEDED, AuditLog
 from jabberscribe.config import Config
-from jabberscribe.jobs import FAILED, GROUPED, QUEUED, WAITING, Job, JobStore
+from jabberscribe.jobs import COPY_STAGES, FAILED, GROUPED, QUEUED, WAITING, Job, JobStore
 from jabberscribe.output import RESULT_FILE, TEXT_FILES, update_owners
 from jabberscribe.sidecar import Party, parse_sidecar
 
@@ -83,6 +88,11 @@ def _end(job: Job) -> datetime:
 def _rank(job: Job) -> tuple[int, datetime]:
     # Longest recording first; a tie goes to whoever joined first.
     return (-job.duration_sec, _start(job))
+
+
+def _copy_failed(job: Job) -> bool:
+    """FAILED on its own recording: the failure struck in the audio or STT stage, so another copy may do better."""
+    return job.status == FAILED and job.stage in COPY_STAGES
 
 
 def _span(primary: Job, store: JobStore) -> tuple[datetime, datetime]:
@@ -241,8 +251,9 @@ def _settle_conference(
 
     for copy in sorted((j for j in jobs if j.status == WAITING), key=_rank):
         overlapping = [p for p in primaries if _overlaps(copy, _span(p, store), slack)]
-        live = [p for p in overlapping if p.status != FAILED]
-        failed = [p for p in overlapping if p.status == FAILED]
+        # A primary that failed for a system reason keeps its group like a live one.
+        live = [p for p in overlapping if not _copy_failed(p)]
+        failed = [p for p in overlapping if _copy_failed(p)]
         if not overlapping:
             unmatched.append(copy)
             continue
@@ -251,8 +262,8 @@ def _settle_conference(
             primaries = [p for p in primaries if p not in overlapping] + [winner]
 
     for primary in primaries:
-        if primary.status == FAILED:
-            # A failed primary never keeps its conference: elect the longest of its copies.
+        if _copy_failed(primary):
+            # A copy that failed on its own recording does not keep its conference: elect the longest of its copies.
             _merge(cfg, store, audit, None, [], [primary], slack, changes)
 
     for cluster in _clusters(unmatched, slack):
@@ -286,3 +297,27 @@ def settle(
             # One unreachable folder must not hold up every other conference; the next poll retries.
             log.warning("cannot settle conference %s yet, retrying next poll", cid, exc_info=True)
     return SettleResult(tuple(changes.released), tuple(changes.attached), tuple(changes.superseded))
+
+
+def requeue_failed(store: JobStore, job_key: str) -> str | None:
+    """Give a FAILED job, or its conference, a fresh set of attempts (`retry`). Returns the key requeued.
+
+    `job_key` may be the failed primary or a failed copy handed over to it.
+    When copy after copy failed and handed the conference on, the longest
+    failed copy becomes the primary again, from scratch, rather than the last
+    one elected. None when the job, or its conference's primary, is not FAILED.
+    """
+    root = store.get(job_key)
+    seen: set[str] = set()
+    while root is not None and root.grouped_into is not None and root.job_key not in seen:
+        seen.add(root.job_key)
+        root = store.get(root.grouped_into)
+    if root is None or root.status != FAILED or root.grouped_into is not None:
+        return None
+    best = min([j for j in [root, *store.members(root.job_key)] if j.status == FAILED], key=_rank)
+    if best.job_key == root.job_key:
+        return root.job_key if store.requeue(root.job_key) else None
+    store.hand_over(root.job_key, best.job_key)
+    store.reset_job(best.job_key)
+    log.info("conference %s: retry restarts from %s, its longest failed copy", root.conference_id, best.job_key)
+    return best.job_key

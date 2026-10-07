@@ -28,7 +28,7 @@ import httpx
 
 from jabberscribe.audit import AuditLog
 from jabberscribe.config import Config, ConfigError, GroupConfig, load_config
-from jabberscribe.group import settle
+from jabberscribe.group import requeue_failed, settle
 from jabberscribe.jobs import DONE, FAILED, GROUPED, QUEUED, RUNNING, WAITING, JobStore, SchemaError
 from jabberscribe.llm import TransientError, make_client, post
 from jabberscribe.lock import LockError, instance_lock
@@ -296,10 +296,13 @@ def _retry(store: JobStore, job_key: str | None, all_failed: bool) -> int:
         keys = [job_key]
     refused = 0
     for key in keys:
-        if store.requeue(key):
+        requeued = requeue_failed(store, key)
+        if requeued == key:
             print(f"{key}: requeued")
+        elif requeued is not None:
+            print(f"{requeued}: requeued (longest failed copy of {key}'s conference)")
         else:
-            print(f"{key}: not a failed primary job; nothing requeued", file=sys.stderr)
+            print(f"{key}: not a failed job of a failed conference; nothing requeued", file=sys.stderr)
             refused += 1
     return 1 if refused else 0
 
@@ -307,9 +310,10 @@ def _retry(store: JobStore, job_key: str | None, all_failed: bool) -> int:
 def _status(store: JobStore) -> int:
     """Counts by status, the oldest waiting and queued job, and every retrying or failed job.
 
-    Exits 1 while any job is FAILED, so a scheduled task can alert on it.
+    Exits 1 while any FAILED job is not superseded by a DONE primary, so a scheduled task can alert on it.
     """
     jobs = store.list_all()
+    by_key = {j.job_key: j for j in jobs}
     counts = Counter(j.status for j in jobs)
     for status in STATUS_ORDER:
         print(f"{status}: {counts[status]}")
@@ -320,15 +324,19 @@ def _status(store: JobStore) -> int:
             oldest = min(pending, key=lambda j: j.created_at)
             minutes = (now - datetime.fromisoformat(oldest.created_at)).total_seconds() / 60
             print(f"oldest {status}: {oldest.job_key} for {minutes:.0f} min")
+    unresolved = False
     for job in jobs:
         if job.status == QUEUED and job.next_attempt_at:
             print(
                 f"  ~ {job.job_key}: attempt {job.attempts} (+{job.transient_failures} transient), "
                 f"next at {job.next_attempt_at}: {job.last_error}"
             )
-        if job.status == FAILED and job.grouped_into is None:
-            print(f"  ! {job.job_key}: {job.last_error}")
-    return 1 if any(j.status == FAILED and j.grouped_into is None for j in jobs) else 0
+        if job.status == FAILED:
+            primary = by_key.get(job.grouped_into) if job.grouped_into else None
+            note = f" (handed over to {job.grouped_into})" if job.grouped_into else ""
+            print(f"  ! {job.job_key}: {job.last_error}{note}")
+            unresolved = unresolved or primary is None or primary.status != DONE
+    return 1 if unresolved else 0
 
 
 def _build_parser() -> argparse.ArgumentParser:

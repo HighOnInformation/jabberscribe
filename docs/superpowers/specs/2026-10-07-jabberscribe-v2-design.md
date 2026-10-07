@@ -134,8 +134,13 @@ recurring Meet-Me number, therefore starts a new group:
   from scratch, the earlier copy's text outputs are deleted (audited as `superseded`),
   and the group still ends with one output.
 - A copy that bridges several groups merges them; the longest copy wins.
-- A failed copy never keeps its group: the failed primary is merged into the winner and the
-  next-longest copy is processed instead.
+- A copy that failed on its own recording (in the `audio` or `stt` stage) does not keep its
+  group: the failed primary is merged into the winner and the next-longest copy is processed
+  instead. A failure in `summarize` or `output` is not the copy's fault — every copy would
+  fail the same way — so the primary stays `failed` with its members, for
+  `jabberscribe retry` once the cause is fixed. Retrying a group whose failed copies were
+  handed over restarts it from the longest failed copy. `status` lists handed-over failed
+  copies too, and exits 1 while any failed job is not superseded by a `done` primary.
 - Superseded outputs are deleted before re-election; if a file is locked, re-election waits for the next poll.
 
 **Deviation pending owner sign-off.** The replacement rule means a meeting can be

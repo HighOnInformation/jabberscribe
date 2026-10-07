@@ -33,6 +33,9 @@ ACTIVE: tuple[str, ...] = (QUEUED, RUNNING, WAITING)
 
 STAGE_ORDER: tuple[str, ...] = ("audio", "stt", "summarize", "output")
 
+#: The checkpoint of a job that failed in the audio or STT stage: a failure of that copy's recording.
+COPY_STAGES: tuple[str, ...] = (QUEUED, "audio")
+
 #: Stored in PRAGMA user_version. A database written by any other version is refused.
 SCHEMA_VERSION = 2
 
@@ -372,13 +375,13 @@ class JobStore:
         return [r["conference_id"] for r in rows]
 
     def conference_ids_to_settle(self) -> list[str]:
-        """Conferences with a waiting copy, or with a FAILED primary that still has members to elect."""
+        """Conferences with a waiting copy, or with a primary FAILED in COPY_STAGES that still has members to elect."""
         rows = self._conn.execute(
             "SELECT DISTINCT conference_id FROM jobs j WHERE conference_id IS NOT NULL AND (status = ?"
-            " OR (status = ? AND grouped_into IS NULL"
+            " OR (status = ? AND grouped_into IS NULL AND stage IN (?, ?)"
             " AND EXISTS (SELECT 1 FROM jobs m WHERE m.grouped_into = j.job_key AND m.status = ?)))"
             " ORDER BY conference_id",
-            (WAITING, FAILED, GROUPED),
+            (WAITING, FAILED, *COPY_STAGES, GROUPED),
         ).fetchall()
         return [r["conference_id"] for r in rows]
 

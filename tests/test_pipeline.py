@@ -374,3 +374,35 @@ def test_run_job_refuses_a_finished_job(cfg, store, audit, make_wav, make_sideca
     store.set_status(key, DONE)
 
     assert run_job(key, cfg, store, FakeTranscriber(), FakeSummarizer()) is False
+
+
+def test_summary_rejection_fails_only_the_primary_of_a_conference(cfg, store, audit, make_wav, make_sidecar) -> None:
+    """Reviewer probe: a summary 4xx must not walk re-election through every copy."""
+    from jabberscribe.audit import SUPERSEDED
+    from jabberscribe.group import requeue_failed, settle
+    from jabberscribe.summarize import SummaryError
+
+    class RejectingSummarizer:
+        def summarize(self, segments: list[Segment]) -> Summary | None:
+            raise SummaryError("summary request rejected: 401")
+
+    keys = [
+        _enqueue(cfg, store, audit, make_wav, make_sidecar, call_id=leg, extension=ext, conference_id="m", **extra)
+        for leg, ext, extra in (("a", "1", {"duration_sec": 300}), ("b", "2", {"duration_sec": 200}),
+                                ("c", "3", {"duration_sec": 100}))
+    ]
+    longest, *others = keys
+    transcriber = FakeTranscriber()
+    base = datetime.now(UTC) + timedelta(days=1)
+    for hour in range(3 * MAX_ATTEMPTS):
+        settle(cfg, store, audit, base + timedelta(hours=hour))
+        _run_at(base + timedelta(hours=hour), cfg, store, transcriber, RejectingSummarizer())
+
+    assert (store.get(longest).status, store.get(longest).grouped_into) == (FAILED, None)
+    assert {(store.get(k).status, store.get(k).grouped_into) for k in others} == {(GROUPED, longest)}
+    assert len(transcriber.calls) == 1
+    assert (cfg.paths.work_dir / longest / pipeline.SEGMENTS_FILE).is_file()
+    assert all(e.action != SUPERSEDED for k in keys for e in audit.entries(k))
+
+    assert requeue_failed(store, longest) == longest
+    assert (store.get(longest).status, store.get(longest).stage) == (QUEUED, "stt")

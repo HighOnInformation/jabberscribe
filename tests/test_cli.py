@@ -501,3 +501,62 @@ def test_run_exits_2_for_an_unreadable_vocabulary_file(tmp_path, cfg_file, capsy
 
     assert main(["--config", str(cfg_file), "run", "--once"]) == 2
     assert "vocabulary" in capsys.readouterr().err
+
+
+def _failed_chain(tmp_path: Path) -> JobStore:
+    """Copies a (300 s), b (200 s), c (100 s) of one conference; each failed and handed over, c last."""
+    store = JobStore(tmp_path / "js.db")
+    store.init_schema()
+    for key, seconds in (("a_1", 300), ("b_2", 200), ("c_3", 100)):
+        store.create(
+            job_key=key,
+            call_id=key[0],
+            conference_id="conf",
+            audio_path=tmp_path / "out" / key / "recording.wav",
+            out_dir=tmp_path / "out" / key,
+            sidecar_json="{}",
+            started_at="2026-10-07T14:00:00+03:00",
+            duration_sec=seconds,
+        )
+        store.record_attempt(key, "audio: share offline")
+        store.set_status(key, FAILED)
+    store.hand_over("a_1", "b_2")
+    store.hand_over("b_2", "c_3")
+    return store
+
+
+def test_retry_failed_restarts_a_handed_over_chain_from_the_longest_copy(tmp_path, cfg_file, capsys) -> None:
+    _failed_chain(tmp_path)
+
+    assert main(["--config", str(cfg_file), "retry", "--failed"]) == 0
+
+    store = JobStore(tmp_path / "js.db")
+    assert (store.get("a_1").status, store.get("a_1").grouped_into) == (QUEUED, None)
+    assert {m.job_key for m in store.members("a_1")} == {"b_2", "c_3"}
+    assert "a_1: requeued" in capsys.readouterr().out
+
+
+def test_retry_by_key_of_a_handed_over_copy_requeues_the_longest(tmp_path, cfg_file) -> None:
+    _failed_chain(tmp_path)
+
+    assert main(["--config", str(cfg_file), "retry", "c_3"]) == 0
+
+    assert JobStore(tmp_path / "js.db").get("a_1").status == QUEUED
+
+
+def test_status_lists_handed_over_failed_copies(tmp_path, cfg_file, capsys) -> None:
+    _failed_chain(tmp_path)
+
+    assert main(["--config", str(cfg_file), "status"]) == 1
+
+    out = capsys.readouterr().out
+    assert "! a_1: audio: share offline (handed over to c_3)" in out
+    assert "! c_3: audio: share offline" in out
+
+
+def test_status_is_zero_when_failed_copies_were_superseded_by_a_done_primary(tmp_path, cfg_file, capsys) -> None:
+    store = _failed_chain(tmp_path)
+    store.set_status("c_3", DONE)
+
+    assert main(["--config", str(cfg_file), "status"]) == 0
+    assert "(handed over to c_3)" in capsys.readouterr().out
