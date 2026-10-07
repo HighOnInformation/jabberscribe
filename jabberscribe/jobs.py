@@ -6,7 +6,8 @@ broker and changing nothing else.
 
 A job is one recorded line's copy of a call, keyed by job_key. Every stage
 checkpoints here, so a crashed worker resumes at the next incomplete stage
-instead of re-transcribing.
+instead of re-transcribing. A job that failed waits in QUEUED until its
+next_attempt_at; claim_next skips it until then.
 """
 
 from __future__ import annotations
@@ -27,32 +28,49 @@ GROUPED = "grouped"
 
 STAGE_ORDER: tuple[str, ...] = ("audio", "stt", "summarize", "output")
 
+#: Stored in PRAGMA user_version. A database written by any other version is refused.
+SCHEMA_VERSION = 2
+
+#: What a scrubbed row keeps of its sidecar once the text retention has passed.
+SCRUBBED_SIDECAR = "{}"
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
-  job_key       TEXT PRIMARY KEY,
-  call_id       TEXT NOT NULL,
-  conference_id TEXT,
-  status        TEXT NOT NULL,
-  stage         TEXT NOT NULL,
-  audio_path    TEXT NOT NULL,
-  out_dir       TEXT NOT NULL,
-  sidecar_json  TEXT NOT NULL,
-  started_at    TEXT NOT NULL,
-  duration_sec  INTEGER NOT NULL,
-  grouped_into  TEXT REFERENCES jobs (job_key),
-  attempts      INTEGER NOT NULL DEFAULT 0,
-  last_error    TEXT,
-  created_at    TEXT NOT NULL,
-  updated_at    TEXT NOT NULL
+  job_key         TEXT PRIMARY KEY,
+  call_id         TEXT NOT NULL,
+  conference_id   TEXT,
+  status          TEXT NOT NULL,
+  stage           TEXT NOT NULL,
+  audio_path      TEXT NOT NULL,
+  out_dir         TEXT NOT NULL,
+  sidecar_json    TEXT NOT NULL,
+  started_at      TEXT NOT NULL,
+  duration_sec    INTEGER NOT NULL,
+  grouped_into    TEXT REFERENCES jobs (job_key),
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  last_error      TEXT,
+  next_attempt_at TEXT,
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs (status, created_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_conference ON jobs (conference_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_grouped_into ON jobs (grouped_into);
 """
 
 
+class SchemaError(RuntimeError):
+    """The database was written by another JabberScribe version."""
+
+
+def iso(moment: datetime) -> str:
+    """The one timestamp format the store writes, so stored values compare as strings."""
+    return moment.astimezone(UTC).isoformat(timespec="seconds")
+
+
 def utcnow() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds")
+    return iso(datetime.now(UTC))
 
 
 def next_stage(stage: str) -> str | None:
@@ -81,6 +99,7 @@ class Job:
     attempts: int
     last_error: str | None
     created_at: str
+    next_attempt_at: str | None
 
 
 def _row_to_job(row: sqlite3.Row) -> Job:
@@ -99,6 +118,7 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         attempts=row["attempts"],
         last_error=row["last_error"],
         created_at=row["created_at"],
+        next_attempt_at=row["next_attempt_at"],
     )
 
 
@@ -116,7 +136,19 @@ class JobStore:
         self._conn.close()
 
     def init_schema(self) -> None:
+        """Create the tables, or refuse a database written by another version.
+
+        CREATE TABLE IF NOT EXISTS would silently keep an older jobs table and
+        fail later with a cryptic column error, so the version is checked first.
+        """
+        version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        has_jobs = self._conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'").fetchone()
+        if has_jobs and version != SCHEMA_VERSION:
+            raise SchemaError(
+                f"database schema version {version} is not {SCHEMA_VERSION}; point paths.db_path at a fresh file"
+            )
         self._conn.executescript(_SCHEMA)
+        self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def create(
         self,
@@ -166,21 +198,33 @@ class JobStore:
         row = self._conn.execute("SELECT * FROM jobs WHERE job_key = ?", (job_key,)).fetchone()
         return _row_to_job(row) if row else None
 
-    def claim_next(self) -> Job | None:
-        """Claim the oldest runnable job and mark it running.
+    def claim_next(self, now: datetime | None = None) -> Job | None:
+        """Claim the oldest runnable job that is due and mark it running.
 
+        A job whose next_attempt_at is still in the future is skipped, not
+        waited for, so one failing job never blocks the jobs behind it.
         `running` rows are claimable because a row left running belongs to a
-        crashed worker; its checkpointed stage tells us where to resume. This is
-        safe under the single-worker deployment this design specifies.
+        crashed worker; its checkpointed stage tells us where to resume. The
+        single-instance lock (lock.py) makes that safe.
         """
+        due = iso(now or datetime.now(UTC))
         row = self._conn.execute(
-            "SELECT * FROM jobs WHERE status IN (?, ?) ORDER BY created_at, rowid LIMIT 1",
-            (QUEUED, RUNNING),
+            "SELECT * FROM jobs WHERE status IN (?, ?) AND (next_attempt_at IS NULL OR next_attempt_at <= ?)"
+            " ORDER BY created_at, rowid LIMIT 1",
+            (QUEUED, RUNNING, due),
         ).fetchone()
         if row is None:
             return None
         self.set_status(row["job_key"], RUNNING)
         return self.get(row["job_key"])
+
+    def claim(self, job_key: str) -> Job | None:
+        """Claim one specific job now, due or not. Returns None unless it is QUEUED or RUNNING."""
+        cur = self._conn.execute(
+            "UPDATE jobs SET status = ?, updated_at = ? WHERE job_key = ? AND status IN (?, ?)",
+            (RUNNING, utcnow(), job_key, QUEUED, RUNNING),
+        )
+        return self.get(job_key) if cur.rowcount else None
 
     def complete_stage(self, job_key: str, stage: str) -> None:
         self._conn.execute(
@@ -205,6 +249,59 @@ class JobStore:
             raise KeyError(f"unknown job_key: {job_key}")
         return int(row["attempts"])
 
+    def schedule_retry(self, job_key: str, at: datetime) -> None:
+        """Put a failed job back in the queue, not to be claimed before `at`."""
+        self._conn.execute(
+            "UPDATE jobs SET status = ?, next_attempt_at = ?, updated_at = ? WHERE job_key = ?",
+            (QUEUED, iso(at), utcnow(), job_key),
+        )
+
+    def requeue(self, job_key: str) -> bool:
+        """Give a FAILED job a fresh set of attempts. Returns False if it is not a FAILED primary.
+
+        A FAILED job that was handed over to another copy (grouped_into set)
+        is not requeued: its conference already has a primary.
+        """
+        cur = self._conn.execute(
+            "UPDATE jobs SET status = ?, attempts = 0, next_attempt_at = NULL, updated_at = ?"
+            " WHERE job_key = ? AND status = ? AND grouped_into IS NULL",
+            (QUEUED, utcnow(), job_key, FAILED),
+        )
+        return cur.rowcount == 1
+
+    def reset_job(self, job_key: str) -> None:
+        """Make a conference copy the primary from scratch: QUEUED, no stage done, no attempts."""
+        self._conn.execute(
+            "UPDATE jobs SET status = ?, stage = ?, grouped_into = NULL, attempts = 0, last_error = NULL,"
+            " next_attempt_at = NULL, updated_at = ? WHERE job_key = ?",
+            (QUEUED, QUEUED, utcnow(), job_key),
+        )
+
+    def hand_over(self, old_primary: str, new_primary: str) -> None:
+        """Move a conference from one primary to another.
+
+        Every member follows, and the old primary becomes a member too: GROUPED,
+        or still FAILED if it failed, so it is never elected again.
+        """
+        now = utcnow()
+        self._conn.execute(
+            "UPDATE jobs SET grouped_into = ?, updated_at = ? WHERE grouped_into = ? AND job_key != ?",
+            (new_primary, now, old_primary, new_primary),
+        )
+        self._conn.execute(
+            "UPDATE jobs SET grouped_into = ?, status = CASE WHEN status = ? THEN ? ELSE ? END, updated_at = ?"
+            " WHERE job_key = ?",
+            (new_primary, FAILED, FAILED, GROUPED, now, old_primary),
+        )
+
+    def scrub_sidecar(self, job_key: str) -> bool:
+        """Drop the call metadata of a row past text retention. Returns False if already scrubbed."""
+        cur = self._conn.execute(
+            "UPDATE jobs SET sidecar_json = ?, updated_at = ? WHERE job_key = ? AND sidecar_json != ?",
+            (SCRUBBED_SIDECAR, utcnow(), job_key, SCRUBBED_SIDECAR),
+        )
+        return cur.rowcount == 1
+
     def list_all(self) -> list[Job]:
         rows = self._conn.execute("SELECT * FROM jobs ORDER BY created_at, rowid").fetchall()
         return [_row_to_job(r) for r in rows]
@@ -218,6 +315,17 @@ class JobStore:
     def waiting_conference_ids(self) -> list[str]:
         rows = self._conn.execute(
             "SELECT DISTINCT conference_id FROM jobs WHERE status = ? ORDER BY conference_id", (WAITING,)
+        ).fetchall()
+        return [r["conference_id"] for r in rows]
+
+    def conference_ids_to_settle(self) -> list[str]:
+        """Conferences with a waiting copy, or with a FAILED primary that still has members to elect."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT conference_id FROM jobs j WHERE conference_id IS NOT NULL AND (status = ?"
+            " OR (status = ? AND grouped_into IS NULL"
+            " AND EXISTS (SELECT 1 FROM jobs m WHERE m.grouped_into = j.job_key AND m.status = ?)))"
+            " ORDER BY conference_id",
+            (WAITING, FAILED, GROUPED),
         ).fetchall()
         return [r["conference_id"] for r in rows]
 
