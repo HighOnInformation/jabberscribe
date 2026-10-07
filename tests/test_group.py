@@ -725,3 +725,22 @@ def test_requeue_failed_refuses_a_copy_whose_primary_is_done(cfg, store, audit, 
 
     assert group.requeue_failed(store, longest) is None
     assert store.get(longest).status == FAILED
+
+
+def test_any_error_in_one_conference_does_not_stop_the_others(
+    cfg, store, audit, make_wav, make_sidecar, monkeypatch
+) -> None:
+    broken = _drop(cfg, store, audit, make_wav, make_sidecar, "a", "1042", conference_id="conf-1")
+    fine = _drop(cfg, store, audit, make_wav, make_sidecar, "b", "2210", conference_id="conf-2")
+    _age(cfg, broken, 61)
+    _age(cfg, fine, 61)
+    real = group._settle_conference
+
+    def buggy(cfg, store, audit, now, conference_id, changes):
+        if conference_id == "conf-1":
+            raise RuntimeError("bug")
+        real(cfg, store, audit, now, conference_id, changes)
+
+    monkeypatch.setattr(group, "_settle_conference", buggy)
+
+    assert _settle(cfg, store, audit).released == (fine,)

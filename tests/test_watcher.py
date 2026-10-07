@@ -2,8 +2,6 @@ import shutil
 import sqlite3
 from pathlib import Path
 
-import pytest
-
 from jabberscribe.audit import DISCARDED_DUPLICATE, QUARANTINED
 from jabberscribe.jobs import QUEUED, WAITING
 from jabberscribe.watcher import find_ready_pairs, scan_once
@@ -286,8 +284,7 @@ def test_failed_create_leaves_the_inbox_pair_in_place(cfg, store, audit, make_wa
 
     monkeypatch.setattr(store, "create", locked)
 
-    with pytest.raises(sqlite3.OperationalError):
-        scan_once(cfg, store, audit)
+    assert scan_once(cfg, store, audit).deferred == ("a",)
 
     assert (cfg.paths.inbox / "a.wav").is_file()
     assert (cfg.paths.inbox / "a.json").is_file()
@@ -330,3 +327,53 @@ def _write_half_then_fail(src, dst, *args, **kwargs):
     with open(dst, "wb") as fh:
         fh.write(b"RIFF")
     raise OSError("disk full")
+
+
+def test_deeply_nested_sidecar_is_quarantined_and_the_scan_goes_on(cfg, store, audit, make_wav, make_sidecar) -> None:
+    """Reviewer probe: json.loads raises RecursionError, not JSONDecodeError, on deep nesting."""
+    make_wav(cfg.paths.inbox / "a.wav")
+    (cfg.paths.inbox / "a.json").write_text("[" * 100000, encoding="utf-8")
+    make_wav(cfg.paths.inbox / "b.wav")
+    make_sidecar(cfg.paths.inbox / "b.json", call_id="fine")
+
+    result = scan_once(cfg, store, audit)
+
+    assert result.quarantined == ("a",)
+    assert result.enqueued == ("fine_1042",)
+    assert (cfg.paths.quarantine / "a.reason.txt").read_text(encoding="utf-8")
+
+
+def test_any_sidecar_parse_error_quarantines_with_its_reason(cfg, store, audit, make_wav, make_sidecar, monkeypatch):
+    make_wav(cfg.paths.inbox / "a.wav")
+    make_sidecar(cfg.paths.inbox / "a.json")
+
+    def broken(text):
+        raise ValueError("parser bug")
+
+    monkeypatch.setattr("jabberscribe.watcher.parse_sidecar", broken)
+
+    assert scan_once(cfg, store, audit).quarantined == ("a",)
+    assert "parser bug" in (cfg.paths.quarantine / "a.reason.txt").read_text(encoding="utf-8")
+
+
+def test_unexpected_error_on_one_pair_defers_it_and_the_scan_goes_on(
+    cfg, store, audit, make_wav, make_sidecar, monkeypatch
+) -> None:
+    make_wav(cfg.paths.inbox / "a.wav")
+    make_sidecar(cfg.paths.inbox / "a.json", call_id="stuck")
+    make_wav(cfg.paths.inbox / "b.wav")
+    make_sidecar(cfg.paths.inbox / "b.json", call_id="fine")
+    real_create = store.create
+
+    def create(**kwargs):
+        if kwargs["call_id"] == "stuck":
+            raise sqlite3.OperationalError("database is locked")
+        return real_create(**kwargs)
+
+    monkeypatch.setattr(store, "create", create)
+
+    result = scan_once(cfg, store, audit)
+
+    assert result.deferred == ("a",)
+    assert result.enqueued == ("fine_1042",)
+    assert (cfg.paths.inbox / "a.json").is_file()

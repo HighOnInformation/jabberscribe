@@ -560,3 +560,23 @@ def test_status_is_zero_when_failed_copies_were_superseded_by_a_done_primary(tmp
 
     assert main(["--config", str(cfg_file), "status"]) == 0
     assert "(handed over to c_3)" in capsys.readouterr().out
+
+
+def test_run_gives_each_phase_its_own_chance(cfg_file, fake_litellm, monkeypatch) -> None:
+    """A scan that raises must not skip settle, processing, or purge in the same poll."""
+    ran: list[str] = []
+
+    def phase(name: str, fail: bool = False):
+        def call(*args, **kwargs):
+            ran.append(name)
+            if fail:
+                raise RuntimeError(f"{name} bug")
+
+        return call
+
+    monkeypatch.setattr(cli, "scan_once", phase("scan", fail=True))
+    monkeypatch.setattr(cli, "settle", phase("settle", fail=True))
+    monkeypatch.setattr(cli, "run_once", phase("process"))
+
+    assert main(["--config", str(cfg_file), "run", "--once"]) == 1
+    assert ran == ["scan", "settle", "process"]

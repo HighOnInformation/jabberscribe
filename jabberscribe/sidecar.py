@@ -99,7 +99,8 @@ def parse_sidecar(text: str) -> Sidecar:
     text = text.lstrip("\N{BYTE ORDER MARK}")
     try:
         data = json.loads(text)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, RecursionError) as exc:
+        # json.loads raises RecursionError, not JSONDecodeError, on deeply nested input.
         raise SidecarError(f"sidecar is not valid JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise SidecarError("sidecar must be a JSON object")

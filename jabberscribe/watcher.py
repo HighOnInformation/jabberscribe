@@ -5,8 +5,9 @@ first (as .part, then renames) and the sidecar last, so a sidecar's presence
 proves the audio is complete. A min-age guard catches a recorder that died
 mid-write, where the sidecar exists but nothing is finished.
 
-One bad pair must never block the rest of the inbox: a filesystem error on a
-pair is logged and the pair is left for the next scan.
+One bad pair must never block the rest of the inbox: a sidecar that cannot be
+parsed, for any reason, is quarantined; any other error on a pair is logged
+and the pair is left for the next scan.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ class ScanResult:
     enqueued: tuple[str, ...] = ()
     quarantined: tuple[str, ...] = ()
     skipped: tuple[str, ...] = ()
-    #: Stems of pairs that hit a filesystem error and stay in the inbox for the next scan.
+    #: Stems of pairs that hit an error (a filesystem one, usually) and stay in the inbox for the next scan.
     deferred: tuple[str, ...] = ()
 
 
@@ -167,8 +168,12 @@ def scan_once(cfg: Config, store: JobStore, audit: AuditLog, min_age_seconds: in
         try:
             try:
                 sidecar = _read_sidecar(sidecar_path, now)
-            except SidecarError as exc:
-                quarantine_pair([audio, sidecar_path], cfg.paths.quarantine, str(exc), audit)
+            except OSError:
+                raise
+            except Exception as exc:
+                # Unparseable for any reason, a RecursionError from deep nesting included.
+                reason = str(exc) if isinstance(exc, SidecarError) else f"cannot parse sidecar: {exc!r}"
+                quarantine_pair([audio, sidecar_path], cfg.paths.quarantine, reason, audit)
                 quarantined.append(sidecar_path.stem)
                 continue
             if _ingest(cfg, store, audit, audio, sidecar, sidecar_path):
@@ -176,8 +181,9 @@ def scan_once(cfg: Config, store: JobStore, audit: AuditLog, min_age_seconds: in
                 log.info("enqueued %s", sidecar.job_key)
             else:
                 skipped.append(sidecar.job_key)
-        except OSError as exc:
-            # A locked file (AV scanner, indexer) or a bad ACL: leave the pair and move on.
+        except Exception as exc:
+            # A locked file (AV scanner, indexer), a bad ACL, a locked database or a bug:
+            # leave the pair and move on.
             log.error("cannot ingest %s, will retry next scan: %s", sidecar_path.stem, exc, exc_info=True)
             deferred.append(sidecar_path.stem)
 

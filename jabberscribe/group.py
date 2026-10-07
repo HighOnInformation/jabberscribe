@@ -293,8 +293,8 @@ def settle(
     for cid in [conference_id] if conference_id else store.conference_ids_to_settle():
         try:
             _settle_conference(cfg, store, audit, now, cid, changes)
-        except OSError:
-            # One unreachable folder must not hold up every other conference; the next poll retries.
+        except Exception:
+            # One unreachable folder (or a bug) must not hold up every other conference; the next poll retries.
             log.warning("cannot settle conference %s yet, retrying next poll", cid, exc_info=True)
     return SettleResult(tuple(changes.released), tuple(changes.attached), tuple(changes.superseded))
 

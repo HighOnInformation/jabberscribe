@@ -5,7 +5,8 @@ silently at 2 a.m.: it sends a real chat completion and a real transcription
 through LiteLLM, not just a model listing.
 
 `run`, `process` and `purge` hold the single-instance lock. `run` never dies on
-a bad poll: each iteration logs its error and the loop carries on. Operator
+a bad poll: each phase (scan, settle, process, purge) logs its own error and
+the loop carries on. Operator
 output is English, like the logs; user-facing files are Hebrew.
 """
 
@@ -263,14 +264,18 @@ def _serve(cfg: Config, store: JobStore, audit: AuditLog, once: bool) -> int:
     last_purge: date | None = None
     while True:
         ok = True
-        try:
-            scan_once(cfg, store, audit)
-            settle(cfg, store, audit, _utcnow())
-            run_once(cfg, store, transcriber, summarizer)
-        except Exception:
-            # One bad poll (a locked file, a full disk, a bug) must not stop the service.
-            log.exception("poll failed; continuing")
-            ok = False
+        phases = (
+            ("scan", lambda: scan_once(cfg, store, audit)),
+            ("settle", lambda: settle(cfg, store, audit, _utcnow())),
+            ("process", lambda: run_once(cfg, store, transcriber, summarizer)),
+        )
+        for name, phase in phases:
+            try:
+                phase()
+            except Exception:
+                # One bad phase (a locked file, a full disk, a bug) must not stop the service, nor the other phases.
+                log.exception("%s failed; continuing", name)
+                ok = False
         today = _utcnow().date()
         if last_purge != today:
             # Marked first: a purge that fails is retried tomorrow, not on every poll.
