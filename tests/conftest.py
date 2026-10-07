@@ -67,14 +67,24 @@ def make_wav() -> Callable[..., Path]:
 
 @pytest.fixture
 def make_sidecar() -> Callable[..., Path]:
-    def _make(path: Path, *, call_id: str = "c1", tracks: str = "mixed", **extra: object) -> Path:
+    def _make(
+        path: Path,
+        *,
+        call_id: str = "c1",
+        extension: str = "1042",
+        conference_id: str | None = None,
+        tracks: str = "mixed",
+        **extra: object,
+    ) -> Path:
         payload: dict[str, object] = {
+            "schema_version": 2,
             "call_id": call_id,
-            "source": "endpoint-agent",
-            "kind": "call",
-            "started_at": "2026-08-12T14:03:11+03:00",
+            "conference_id": conference_id,
+            "line_owner": {"extension": extension, "user": "meir", "display_name": "מאיר"},
+            "parties": [{"extension": "2210", "display_name": "דנה"}],
+            "kind": "conference" if conference_id else "call",
+            "started_at": "2026-10-07T14:03:11+03:00",
             "duration_sec": 12,
-            "participants": [{"display_name": "מאיר", "email": "meir@corp.local", "role": "caller"}],
             "audio": {"tracks": tracks, "sample_rate": 8000, "channels": 2 if tracks == "dual" else 1},
         }
         payload.update(extra)

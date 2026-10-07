@@ -2,121 +2,107 @@ import json
 
 import pytest
 
-from jabberscribe.sidecar import SidecarError, parse_sidecar
-
-VALID = {
-    "schema_version": 1,
-    "call_id": "8f2a1c4e",
-    "source": "cucm-bib",
-    "kind": "call",
-    "started_at": "2026-08-12T14:03:11+03:00",
-    "ended_at": "2026-08-12T14:16:43+03:00",
-    "duration_sec": 812,
-    "subject": None,
-    "participants": [
-        {
-            "display_name": "מאיר חדד",
-            "uri": "mhadad@corp.local",
-            "extension": "1042",
-            "email": "mhadad@corp.local",
-            "role": "caller",
-        },
-        {"display_name": "Support", "extension": "1099", "role": "callee"},
-    ],
-    "audio": {"tracks": "dual", "codec": "pcm_s16le", "sample_rate": 8000, "channels": 2},
-}
+from jabberscribe.sidecar import SidecarError, job_key, parse_sidecar
 
 
-def test_parse_valid_sidecar() -> None:
-    sc = parse_sidecar(json.dumps(VALID))
-
-    assert sc.call_id == "8f2a1c4e"
-    assert sc.kind == "call"
-    assert sc.tracks == "dual"
-    assert sc.duration_sec == 812
-    assert sc.sample_rate == 8000
-    assert len(sc.participants) == 2
-    assert sc.participants[0].display_name == "מאיר חדד"
-    assert sc.participants[1].email is None
-
-
-def test_raw_is_preserved_verbatim() -> None:
-    text = json.dumps(VALID)
-
-    assert parse_sidecar(text).raw == text
-
-
-def test_emails_property_skips_missing_and_blank() -> None:
-    payload = dict(VALID)
-    payload["participants"] = [
-        {"email": "a@corp.local"},
-        {"email": ""},
-        {"extension": "1099"},
-        {"email": "b@corp.local"},
-    ]
-
-    assert parse_sidecar(json.dumps(payload)).emails == ("a@corp.local", "b@corp.local")
-
-
-def test_defaults_applied_for_optional_fields() -> None:
-    minimal = {
-        "call_id": "c9",
-        "started_at": "2026-08-12T14:03:11+03:00",
-        "duration_sec": 10,
-        "audio": {"tracks": "mixed"},
+def _doc(**overrides: object) -> str:
+    payload: dict[str, object] = {
+        "schema_version": 2,
+        "call_id": "gcid-1",
+        "conference_id": None,
+        "line_owner": {"extension": "1042", "user": "meir", "display_name": "מאיר"},
+        "parties": [{"extension": "2210", "display_name": "דנה"}],
+        "kind": "call",
+        "started_at": "2026-10-07T14:03:11+03:00",
+        "ended_at": "2026-10-07T14:16:43+03:00",
+        "duration_sec": 812,
+        "audio": {"tracks": "dual", "sample_rate": 8000, "channels": 2},
     }
+    payload.update(overrides)
+    return json.dumps(payload, ensure_ascii=False)
 
-    sc = parse_sidecar(json.dumps(minimal))
 
-    assert sc.kind == "call"
-    assert sc.source == "unknown"
-    assert sc.participants == ()
-    assert sc.ended_at is None
-    assert sc.sample_rate is None
+def test_parses_valid_sidecar() -> None:
+    sidecar = parse_sidecar(_doc())
+
+    assert sidecar.call_id == "gcid-1"
+    assert sidecar.conference_id is None
+    assert sidecar.line_owner.extension == "1042"
+    assert sidecar.line_owner.user == "meir"
+    assert sidecar.parties[0].display_name == "דנה"
+    assert sidecar.kind == "call"
+    assert sidecar.started_at == "2026-10-07T14:03:11+03:00"
+    assert sidecar.ended_at == "2026-10-07T14:16:43+03:00"
+    assert sidecar.duration_sec == 812
+    assert sidecar.tracks == "dual"
+
+
+def test_job_key_combines_call_and_line() -> None:
+    assert parse_sidecar(_doc()).job_key == "gcid-1_1042"
+
+
+def test_job_key_is_filesystem_safe() -> None:
+    assert job_key("a:b/c\\d*e", "10 42") == "a-b-c-d-e_10-42"
+
+
+def test_party_as_dict() -> None:
+    owner = parse_sidecar(_doc()).line_owner
+
+    assert owner.as_dict() == {"extension": "1042", "user": "meir", "display_name": "מאיר"}
+
+
+def test_conference_id_is_parsed() -> None:
+    sidecar = parse_sidecar(_doc(conference_id="conf-9", kind="conference"))
+
+    assert sidecar.conference_id == "conf-9"
+    assert sidecar.kind == "conference"
+
+
+def test_leading_bom_is_tolerated() -> None:
+    assert parse_sidecar("﻿" + _doc()).call_id == "gcid-1"
+
+
+def test_unknown_fields_are_ignored() -> None:
+    assert parse_sidecar(_doc(recorder_build="7.1")).call_id == "gcid-1"
+
+
+def test_missing_parties_defaults_to_empty() -> None:
+    payload = json.loads(_doc())
+    del payload["parties"]
+
+    assert parse_sidecar(json.dumps(payload)).parties == ()
+
+
+def test_rejects_non_json() -> None:
+    with pytest.raises(SidecarError, match="not valid JSON"):
+        parse_sidecar("{nope")
+
+
+def test_rejects_non_object() -> None:
+    with pytest.raises(SidecarError, match="JSON object"):
+        parse_sidecar("[]")
 
 
 @pytest.mark.parametrize(
-    ("mutation", "message"),
+    ("overrides", "fragment"),
     [
-        ({"call_id": None}, "call_id"),
         ({"call_id": ""}, "call_id"),
-        ({"started_at": None}, "started_at"),
-        ({"duration_sec": None}, "duration_sec"),
-        ({"duration_sec": -5}, "duration_sec"),
-        ({"duration_sec": "long"}, "duration_sec"),
-        ({"audio": {}}, "tracks"),
-        ({"audio": {"tracks": "quad"}}, "tracks"),
+        ({"call_id": None}, "call_id"),
+        ({"line_owner": None}, "line_owner"),
+        ({"line_owner": "1042"}, "line_owner"),
+        ({"line_owner": {"user": "meir"}}, "line_owner.extension"),
+        ({"started_at": "yesterday"}, "started_at"),
+        ({"duration_sec": -1}, "duration_sec"),
+        ({"duration_sec": True}, "duration_sec"),
+        ({"duration_sec": "812"}, "duration_sec"),
         ({"audio": None}, "audio"),
+        ({"audio": {"tracks": "quad"}}, "audio.tracks"),
         ({"kind": "webinar"}, "kind"),
+        ({"parties": "everyone"}, "parties"),
+        ({"parties": ["dana"]}, "parties"),
+        ({"conference_id": 7}, "conference_id"),
     ],
 )
-def test_invalid_sidecars_are_rejected(mutation: dict, message: str) -> None:
-    payload = {**VALID, **mutation}
-
-    with pytest.raises(SidecarError, match=message):
-        parse_sidecar(json.dumps(payload))
-
-
-def test_utf8_bom_is_tolerated() -> None:
-    """PowerShell, .NET, and Notepad all emit UTF-8 with a BOM by default."""
-    sc = parse_sidecar("﻿" + json.dumps(VALID))
-
-    assert sc.call_id == "8f2a1c4e"
-    assert not sc.raw.startswith("﻿")
-
-
-def test_malformed_json_is_rejected() -> None:
-    with pytest.raises(SidecarError, match="JSON"):
-        parse_sidecar("{not json")
-
-
-def test_non_object_json_is_rejected() -> None:
-    with pytest.raises(SidecarError, match="object"):
-        parse_sidecar("[1, 2, 3]")
-
-
-def test_participants_must_be_a_list() -> None:
-    payload = {**VALID, "participants": "מאיר"}
-
-    with pytest.raises(SidecarError, match="participants"):
-        parse_sidecar(json.dumps(payload))
+def test_rejects_malformed(overrides: dict, fragment: str) -> None:
+    with pytest.raises(SidecarError, match=fragment):
+        parse_sidecar(_doc(**overrides))

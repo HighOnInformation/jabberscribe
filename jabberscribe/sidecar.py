@@ -1,51 +1,64 @@
-"""Sidecar metadata: the capture layer's half of the drop contract.
+"""Sidecar metadata: the recorder's half of the drop contract.
 
-Validation is deliberately narrow. Only call_id, started_at, duration_sec, and
-audio.tracks are required, because those are the fields the pipeline cannot
-function without. Everything else degrades: a call with no participant emails
-still gets transcribed and published.
+Validation is deliberately narrow. Only call_id, line_owner.extension,
+started_at, duration_sec, and audio.tracks are required -- the fields the
+pipeline cannot work without. Everything else degrades.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
+from datetime import datetime
 
 VALID_TRACKS = ("dual", "mixed")
 VALID_KINDS = ("call", "conference")
+
+_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 
 
 class SidecarError(ValueError):
     """The sidecar is unusable. The caller should quarantine the pair."""
 
 
+def job_key(call_id: str, extension: str) -> str:
+    """Identity of one recorded line's copy of a call.
+
+    It names both the job row and the output folder, so it must be a valid
+    Windows path segment. CUCM shares one call id across both ends of an
+    internal call, which is why the line is part of the key.
+    """
+    return f"{_UNSAFE.sub('-', call_id)}_{_UNSAFE.sub('-', extension)}"
+
+
 @dataclass(frozen=True)
-class Participant:
-    display_name: str | None = None
-    uri: str | None = None
+class Party:
     extension: str | None = None
-    email: str | None = None
-    role: str | None = None
+    user: str | None = None
+    display_name: str | None = None
+
+    def as_dict(self) -> dict[str, str | None]:
+        return {"extension": self.extension, "user": self.user, "display_name": self.display_name}
 
 
 @dataclass(frozen=True)
 class Sidecar:
     call_id: str
+    conference_id: str | None
+    line_owner: Party
+    parties: tuple[Party, ...]
     kind: str
-    source: str
     started_at: str
     ended_at: str | None
     duration_sec: int
-    subject: str | None
-    participants: tuple[Participant, ...]
     tracks: str
-    sample_rate: int | None
-    channels: int | None
     raw: str
 
     @property
-    def emails(self) -> tuple[str, ...]:
-        return tuple(p.email for p in self.participants if p.email)
+    def job_key(self) -> str:
+        # parse_sidecar guarantees a non-empty line_owner.extension.
+        return job_key(self.call_id, self.line_owner.extension or "")
 
 
 def _opt_str(value: object) -> str | None:
@@ -61,15 +74,13 @@ def _require_nonempty_str(data: dict, key: str) -> str:
     return value
 
 
-def _parse_participant(raw: object) -> Participant:
+def _parse_party(raw: object, where: str) -> Party:
     if not isinstance(raw, dict):
-        raise SidecarError("each entry in participants must be an object")
-    return Participant(
-        display_name=_opt_str(raw.get("display_name")),
-        uri=_opt_str(raw.get("uri")),
+        raise SidecarError(f"{where} must be an object")
+    return Party(
         extension=_opt_str(raw.get("extension")),
-        email=_opt_str(raw.get("email")) or None,
-        role=_opt_str(raw.get("role")),
+        user=_opt_str(raw.get("user")),
+        display_name=_opt_str(raw.get("display_name")),
     )
 
 
@@ -91,6 +102,18 @@ def parse_sidecar(text: str) -> Sidecar:
 
     call_id = _require_nonempty_str(data, "call_id")
     started_at = _require_nonempty_str(data, "started_at")
+    try:
+        datetime.fromisoformat(started_at)
+    except ValueError as exc:
+        raise SidecarError(f"started_at must be an ISO 8601 timestamp, got {started_at!r}") from exc
+
+    line_owner = _parse_party(data.get("line_owner"), "line_owner")
+    if not line_owner.extension or not line_owner.extension.strip():
+        raise SidecarError("line_owner.extension is required and must be a non-empty string")
+
+    conference_id = data.get("conference_id")
+    if conference_id is not None and (not isinstance(conference_id, str) or not conference_id.strip()):
+        raise SidecarError("conference_id must be a non-empty string or null")
 
     duration = data.get("duration_sec")
     if isinstance(duration, bool) or not isinstance(duration, int) or duration < 0:
@@ -107,24 +130,19 @@ def parse_sidecar(text: str) -> Sidecar:
     if kind not in VALID_KINDS:
         raise SidecarError(f"kind must be one of {VALID_KINDS}, got {kind!r}")
 
-    raw_participants = data.get("participants") or []
-    if not isinstance(raw_participants, list):
-        raise SidecarError("participants must be a list")
-
-    sample_rate = audio.get("sample_rate")
-    channels = audio.get("channels")
+    raw_parties = data.get("parties") or []
+    if not isinstance(raw_parties, list):
+        raise SidecarError("parties must be a list")
 
     return Sidecar(
         call_id=call_id,
+        conference_id=conference_id,
+        line_owner=line_owner,
+        parties=tuple(_parse_party(p, "each entry in parties") for p in raw_parties),
         kind=kind,
-        source=_opt_str(data.get("source")) or "unknown",
         started_at=started_at,
         ended_at=_opt_str(data.get("ended_at")),
         duration_sec=duration,
-        subject=_opt_str(data.get("subject")),
-        participants=tuple(_parse_participant(p) for p in raw_participants),
         tracks=tracks,
-        sample_rate=sample_rate if isinstance(sample_rate, int) else None,
-        channels=channels if isinstance(channels, int) else None,
         raw=text,
     )
