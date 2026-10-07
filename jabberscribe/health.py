@@ -47,11 +47,16 @@ def write_heartbeat(path: Path, store: JobStore, now: datetime, *, polls: int, l
 
 
 def read_heartbeat(path: Path) -> dict | None:
-    """The last heartbeat, or None when there is none or it cannot be read."""
+    """The last heartbeat, or None when there is none or it cannot be read.
+
+    A last_poll_at without a timezone is unreadable too: its age cannot be compared with an aware clock.
+    """
     try:
         beat = json.loads(path.read_text(encoding="utf-8"))
-        datetime.fromisoformat(beat["last_poll_at"])
+        last_poll = datetime.fromisoformat(beat["last_poll_at"])
     except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if last_poll.tzinfo is None:
         return None
     return beat if isinstance(beat, dict) else None
 

@@ -114,3 +114,10 @@ def test_status_shows_latency_and_heartbeat(cfg_file, store, capsys) -> None:
     capsys.readouterr()
     main(["--config", str(cfg_file), "status"])
     assert "last poll ok" in capsys.readouterr().out
+
+
+def test_a_heartbeat_with_a_naive_timestamp_reads_as_none(tmp_path: Path) -> None:
+    naive = tmp_path / "naive.json"
+    naive.write_text(json.dumps({"last_poll_at": "2026-10-07T11:03:11"}), encoding="utf-8")
+
+    assert read_heartbeat(naive) is None
