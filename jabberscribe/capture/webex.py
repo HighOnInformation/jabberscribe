@@ -14,8 +14,13 @@ docs/superpowers/specs/2026-10-08-webex-capture-design.md.
 
 from __future__ import annotations
 
+import json
 import logging
-from collections.abc import Iterator
+import re
+import sqlite3
+import subprocess
+from collections import Counter
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -34,6 +39,18 @@ MAX_WINDOW = timedelta(days=30)
 
 # ASSUMPTION: admin/compliance list path, from the API reference snippet and wxc_sdk.
 _LIST_PATH = "/admin/convergedRecordings"
+# ASSUMPTION: details, metadata and delete paths are the wxc_sdk ones. The Webex
+# blog says admin/compliance variants exist; whether they differ is unverified.
+_DETAILS_PATH = "/convergedRecordings/{id}"
+_METADATA_PATH = "/convergedRecordings/{id}/metadata"
+_DELETE_PATH = "/convergedRecordings/{id}"
+
+_FFMPEG_TIMEOUT_SECONDS = 1800
+_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+class ExportError(RuntimeError):
+    """One recording could not be exported. Counted against its attempts."""
 
 
 class WebexConfigError(Exception):
@@ -130,6 +147,57 @@ class WebexClient:
                 # The next link carries the full query, so later pages send no params.
                 url = response.links.get("next", {}).get("url")
                 params = None
+
+    def details(self, recording_id: str) -> dict:
+        return self._get(self._base_url + _DETAILS_PATH.format(id=recording_id)).json()
+
+    def metadata(self, recording_id: str) -> dict:
+        """Owner name and participants. Optional: a 403/404 degrades to {} rather than blocking export."""
+        url = self._base_url + _METADATA_PATH.format(id=recording_id)
+        try:
+            return self._get(url, {"showAllTypes": "true"}).json()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in (403, 404):
+                raise
+            log.warning("no metadata for recording %s (HTTP %s)", recording_id, exc.response.status_code)
+            return {}
+
+    def download(self, url: str, dest: Path) -> None:
+        """Stream the audio to `dest` via a .part file so a dead download never looks complete."""
+        request = self._http.build_request("GET", url)
+        if request.url.host != httpx.URL(self._base_url).host:
+            # ASSUMPTION: the temporary link is self-authenticating; never leak the token to another host.
+            del request.headers["Authorization"]
+        part = dest.with_name(dest.name + ".part")
+        response = self._http.send(request, stream=True)
+        try:
+            response.raise_for_status()
+            with part.open("wb") as out:
+                for chunk in response.iter_bytes():
+                    out.write(chunk)
+        finally:
+            response.close()
+        if part.stat().st_size == 0:
+            part.unlink()
+            raise ExportError("downloaded audio is empty")
+        part.replace(dest)
+
+    def delete(self, recording_id: str) -> None:
+        # ASSUMPTION: compliance hard delete takes an optional reason and comment in the body.
+        response = self._http.request(
+            "DELETE",
+            self._base_url + _DELETE_PATH.format(id=recording_id),
+            json={"reasonForDeletion": "exported to JabberScribe", "comment": "exported to JabberScribe"},
+        )
+        response.raise_for_status()
+
+
+def _audio_link(details: dict) -> str:
+    """ASSUMPTION: details carry temporaryDirectDownloadLinks.audioDownloadLink (wxc_sdk model), valid 3 h."""
+    link = (details.get("temporaryDirectDownloadLinks") or {}).get("audioDownloadLink")
+    if not link:
+        raise ExportError("details have no audio download link (recording not ready?)")
+    return link
 
 
 # --- sidecar mapping --------------------------------------------------------
@@ -241,3 +309,218 @@ def to_sidecar(rec: dict, meta: dict, probe: Probe, *, shared_session: bool) -> 
 
 def drop_name(sidecar: dict) -> str:
     return job_key(sidecar["call_id"], sidecar["line_owner"]["extension"])
+
+
+# --- audio and the drop pair ------------------------------------------------
+
+
+def _run(args: list[str]) -> str:
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=_FFMPEG_TIMEOUT_SECONDS, check=False)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        raise ExportError(f"{args[0]} failed: {exc}") from exc
+    if proc.returncode != 0:
+        tail = (proc.stderr or "").strip().splitlines()[-3:]
+        raise ExportError(f"{args[0]} exited {proc.returncode}: {' | '.join(tail)}")
+    return proc.stdout
+
+
+def probe_audio(path: Path, ffprobe: str = "ffprobe") -> Probe:
+    out = _run(
+        [ffprobe, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=channels,sample_rate"]
+        + ["-show_entries", "format=duration", "-of", "json", str(path)]
+    )
+    data = json.loads(out)
+    streams = data.get("streams") or []
+    if not streams:
+        raise ExportError("no audio stream in downloaded file")
+    return Probe(
+        channels=int(streams[0]["channels"]),
+        sample_rate=int(streams[0]["sample_rate"]),
+        duration_sec=float((data.get("format") or {}).get("duration") or 0.0),
+    )
+
+
+def write_drop_pair(inbox: Path, name: str, src_audio: Path, sidecar: dict, ffmpeg: str = "ffmpeg") -> None:
+    """Honour the drop contract: audio .part -> .wav, then the sidecar .part -> .json LAST.
+
+    The watcher treats a sidecar as proof the audio is complete, so nothing may
+    leave a .json in the inbox before the .wav is fully in place.
+    """
+    inbox.mkdir(parents=True, exist_ok=True)
+    wav = inbox / f"{name}.wav"
+    wav_part = inbox / f"{name}.wav.part"
+    json_path = inbox / f"{name}.json"
+    json_part = inbox / f"{name}.json.part"
+    try:
+        # Keep the channel layout and rate: the pipeline splits dual tracks itself.
+        # -f wav is required: the .part suffix defeats ffmpeg's muxer detection.
+        _run([ffmpeg, "-y", "-nostdin", "-i", str(src_audio), "-c:a", "pcm_s16le", "-f", "wav", str(wav_part)])
+        wav_part.replace(wav)
+        json_part.write_text(json.dumps(sidecar, ensure_ascii=False, indent=2), encoding="utf-8")
+        json_part.replace(json_path)
+    finally:
+        wav_part.unlink(missing_ok=True)
+        json_part.unlink(missing_ok=True)
+
+
+# --- ledger -----------------------------------------------------------------
+
+_LEDGER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS exported (
+    recording_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,            -- done | failed
+    job_key TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    updated_at TEXT NOT NULL
+);
+"""
+
+
+class Ledger:
+    """Which Webex recordings are already exported. The exporter's own file, never the jobs DB."""
+
+    def __init__(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(path, isolation_level=None)
+        self._conn.executescript(_LEDGER_SCHEMA)
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def _row(self, recording_id: str) -> tuple[str, int] | None:
+        return self._conn.execute(
+            "SELECT state, attempts FROM exported WHERE recording_id = ?", (recording_id,)
+        ).fetchone()
+
+    def attempts(self, recording_id: str) -> int:
+        row = self._row(recording_id)
+        return row[1] if row else 0
+
+    def is_settled(self, recording_id: str, max_attempts: int) -> bool:
+        """Done, or failed often enough to be parked."""
+        row = self._row(recording_id)
+        return row is not None and (row[0] == "done" or row[1] >= max_attempts)
+
+    def mark_done(self, recording_id: str, key: str) -> None:
+        self._conn.execute(
+            "INSERT INTO exported (recording_id, state, job_key, updated_at) VALUES (?, 'done', ?, ?) "
+            "ON CONFLICT(recording_id) DO UPDATE SET state='done', job_key=excluded.job_key, "
+            "last_error=NULL, updated_at=excluded.updated_at",
+            (recording_id, key, _utcnow()),
+        )
+
+    def mark_failed(self, recording_id: str, error: str) -> int:
+        self._conn.execute(
+            "INSERT INTO exported (recording_id, state, attempts, last_error, updated_at) "
+            "VALUES (?, 'failed', 1, ?, ?) "
+            "ON CONFLICT(recording_id) DO UPDATE SET attempts=attempts+1, last_error=excluded.last_error, "
+            "updated_at=excluded.updated_at",
+            (recording_id, error, _utcnow()),
+        )
+        return self.attempts(recording_id)
+
+
+def _utcnow() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+# --- exporter ---------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PollResult:
+    exported: tuple[str, ...] = ()
+    skipped: tuple[str, ...] = ()
+    failed: tuple[str, ...] = ()
+
+
+def _is_transient(exc: httpx.HTTPError) -> bool:
+    """Rate limits, server errors and network failures say nothing about the recording itself."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return status == 429 or status >= 500
+    return True
+
+
+class Exporter:
+    def __init__(
+        self,
+        cfg: WebexConfig,
+        client: WebexClient,
+        ledger: Ledger,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        self._cfg = cfg
+        self._client = client
+        self._ledger = ledger
+        self._now = now
+
+    def run_once(self) -> PollResult:
+        """One poll. Transient HTTP errors propagate: the poll stops and the next one retries."""
+        end = self._now()
+        start = end - timedelta(hours=self._cfg.lookback_hours)
+        items = list(self._client.list_recordings(start, end, self._cfg.page_size))
+        sessions = Counter(_session_id(item) for item in items)
+        exported: list[str] = []
+        skipped: list[str] = []
+        failed: list[str] = []
+
+        for item in items:
+            rec_id = item["id"]
+            if self._ledger.is_settled(rec_id, self._cfg.max_attempts):
+                skipped.append(rec_id)
+                continue
+            try:
+                key = self._export(item, shared_session=sessions[_session_id(item)] > 1)
+            except httpx.HTTPError as exc:
+                if _is_transient(exc) or not isinstance(exc, httpx.HTTPStatusError):
+                    raise
+                # Status only: the exception text carries the URL, and download URLs are credentials.
+                self._fail(rec_id, f"HTTP {exc.response.status_code}")
+                failed.append(rec_id)
+                continue
+            except ExportError as exc:
+                self._fail(rec_id, str(exc))
+                failed.append(rec_id)
+                continue
+            self._ledger.mark_done(rec_id, key)
+            exported.append(key)
+            log.info("exported recording %s as %s", rec_id, key)
+            if self._cfg.delete_after_export:
+                self._delete(rec_id)
+
+        return PollResult(tuple(exported), tuple(skipped), tuple(failed))
+
+    def _export(self, item: dict, *, shared_session: bool) -> str:
+        rec_id = item["id"]
+        details = self._client.details(rec_id)
+        link = _audio_link(details)
+        meta = self._client.metadata(rec_id)
+        self._cfg.work_dir.mkdir(parents=True, exist_ok=True)
+        mp3 = self._cfg.work_dir / f"{_UNSAFE.sub('-', rec_id)}.mp3"
+        try:
+            self._client.download(link, mp3)
+            probe = probe_audio(mp3, self._cfg.ffprobe)
+            sidecar = to_sidecar({**item, **details}, meta, probe, shared_session=shared_session)
+            name = drop_name(sidecar)
+            write_drop_pair(self._cfg.inbox, name, mp3, sidecar, self._cfg.ffmpeg)
+        finally:
+            mp3.unlink(missing_ok=True)
+        return name
+
+    def _fail(self, rec_id: str, error: str) -> None:
+        attempts = self._ledger.mark_failed(rec_id, error)
+        if attempts >= self._cfg.max_attempts:
+            log.error("parking recording %s after %d attempts: %s", rec_id, attempts, error)
+        else:
+            log.warning("recording %s failed (attempt %d): %s", rec_id, attempts, error)
+
+    def _delete(self, rec_id: str) -> None:
+        try:
+            self._client.delete(rec_id)
+            log.info("deleted Webex copy of recording %s", rec_id)
+        except httpx.HTTPError as exc:
+            # The export already stands; a stale cloud copy is not worth undoing it for.
+            log.error("could not delete Webex copy of recording %s: %s", rec_id, exc.__class__.__name__)

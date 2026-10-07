@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -12,6 +15,8 @@ import pytest
 
 from jabberscribe.capture.webex import (
     MAX_WINDOW,
+    Exporter,
+    Ledger,
     Probe,
     WebexClient,
     WebexConfig,
@@ -19,7 +24,14 @@ from jabberscribe.capture.webex import (
     load_webex_config,
     to_sidecar,
 )
+from jabberscribe.config import Config
+from jabberscribe.jobs import JobStore
 from jabberscribe.sidecar import job_key, parse_sidecar
+from jabberscribe.watcher import scan_once
+
+needs_ffmpeg = pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None, reason="ffmpeg/ffprobe not installed"
+)
 
 BASE = "https://webexapis.test/v1"
 
@@ -193,3 +205,205 @@ def test_missing_numbers_fall_back_to_email_and_ids() -> None:
     assert sidecar.line_owner.extension == "mhadad"
     # No session start: falls back to timeRecorded.
     assert datetime.fromisoformat(sidecar.started_at) == datetime(2026, 10, 7, 11, 3, 15, tzinfo=UTC)
+
+
+# --- export -----------------------------------------------------------------
+
+NOW = datetime(2026, 10, 7, 12, 0, tzinfo=UTC)
+DOWNLOAD_HOST = "https://media.webex.test"
+
+
+class FakeWebex:
+    """Routes the Converged Recordings calls the exporter makes. Records every request."""
+
+    def __init__(self, recordings: list[dict], audio: bytes) -> None:
+        self.recordings = recordings
+        self.audio = audio
+        self.requests: list[httpx.Request] = []
+        self.download_status = 200
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        path = request.url.path
+        if request.url.host == "media.webex.test":
+            return httpx.Response(self.download_status, content=self.audio if self.download_status == 200 else b"")
+        if path.endswith("/admin/convergedRecordings"):
+            return httpx.Response(200, json={"items": self.recordings})
+        rec_id = path.split("/convergedRecordings/")[1].split("/")[0]
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        if path.endswith("/metadata"):
+            return httpx.Response(200, json={"ownerName": "Owner " + rec_id})
+        item = next(r for r in self.recordings if r["id"] == rec_id)
+        links = {"audioDownloadLink": f"{DOWNLOAD_HOST}/{rec_id}.mp3", "expiration": "2026-10-07T15:00:00Z"}
+        return httpx.Response(200, json={**item, "temporaryDirectDownloadLinks": links})
+
+    def calls(self, method: str, fragment: str) -> list[httpx.Request]:
+        return [r for r in self.requests if r.method == method and fragment in str(r.url)]
+
+
+@pytest.fixture
+def mp3_bytes(tmp_path: Path, make_wav: Callable[..., Path]) -> Callable[[int], bytes]:
+    def _make(channels: int) -> bytes:
+        wav = make_wav(tmp_path / f"src{channels}.wav", channels=channels)
+        mp3 = wav.with_suffix(".mp3")
+        subprocess.run(["ffmpeg", "-y", "-nostdin", "-loglevel", "error", "-i", str(wav), str(mp3)], check=True)
+        return mp3.read_bytes()
+
+    return _make
+
+
+@pytest.fixture
+def wcfg(tmp_path: Path) -> WebexConfig:
+    return WebexConfig(
+        inbox=tmp_path / "drop" / "inbox",
+        state_path=tmp_path / "webex-state.db",
+        work_dir=tmp_path / "webex-work",
+        base_url=BASE,
+        max_attempts=2,
+    )
+
+
+def _exporter(cfg: WebexConfig, fake: FakeWebex) -> Exporter:
+    client = WebexClient(cfg.base_url, "tok", transport=httpx.MockTransport(fake))
+    return Exporter(cfg, client, Ledger(cfg.state_path), now=lambda: NOW)
+
+
+def _inbox(cfg: WebexConfig) -> list[str]:
+    return sorted(p.name for p in cfg.inbox.iterdir()) if cfg.inbox.exists() else []
+
+
+@needs_ffmpeg
+def test_export_writes_a_valid_drop_pair(wcfg: WebexConfig, mp3_bytes) -> None:
+    fake = FakeWebex([_recording()], mp3_bytes(2))
+    result = _exporter(wcfg, fake).run_once()
+
+    key = job_key("wxc-sess-1", "1042")
+    assert result.exported == (key,)
+    assert _inbox(wcfg) == [f"{key}.json", f"{key}.wav"]
+    sidecar = parse_sidecar((wcfg.inbox / f"{key}.json").read_text(encoding="utf-8"))
+    assert sidecar.job_key == key
+    assert sidecar.tracks == "dual"
+    assert sidecar.line_owner.display_name == "Owner rec-1"
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_name,channels", "-of", "json"]
+        + [str(wcfg.inbox / f"{key}.wav")],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(probe.stdout)["streams"][0] == {"codec_name": "pcm_s16le", "channels": 2}
+    assert list(wcfg.work_dir.iterdir()) == []
+    # The listing window is the configured lookback, ending now.
+    listed = fake.calls("GET", "/admin/convergedRecordings")[0].url.params
+    assert datetime.fromisoformat(listed["to"]) == NOW
+    assert datetime.fromisoformat(listed["from"]) == NOW - timedelta(hours=wcfg.lookback_hours)
+
+
+@needs_ffmpeg
+def test_mono_recording_is_mixed(wcfg: WebexConfig, mp3_bytes) -> None:
+    _exporter(wcfg, FakeWebex([_recording()], mp3_bytes(1))).run_once()
+    key = job_key("wxc-sess-1", "1042")
+    assert parse_sidecar((wcfg.inbox / f"{key}.json").read_text(encoding="utf-8")).tracks == "mixed"
+
+
+@needs_ffmpeg
+def test_second_poll_skips_exported_recordings(wcfg: WebexConfig, mp3_bytes) -> None:
+    fake = FakeWebex([_recording()], mp3_bytes(1))
+    _exporter(wcfg, fake).run_once()
+    for path in wcfg.inbox.iterdir():
+        path.unlink()  # the watcher consumed the pair
+
+    second = _exporter(wcfg, fake).run_once()
+    assert second.exported == ()
+    assert second.skipped == ("rec-1",)
+    assert _inbox(wcfg) == []
+    assert len(fake.calls("GET", "/convergedRecordings/rec-1")) == 2  # details + metadata, first poll only
+
+
+@needs_ffmpeg
+def test_sidecar_is_renamed_into_place_last(wcfg: WebexConfig, mp3_bytes, monkeypatch) -> None:
+    renamed: list[str] = []
+    original = Path.replace
+
+    def spy(self: Path, target):
+        renamed.append(Path(target).name)
+        return original(self, target)
+
+    monkeypatch.setattr(Path, "replace", spy)
+    _exporter(wcfg, FakeWebex([_recording()], mp3_bytes(1))).run_once()
+
+    key = job_key("wxc-sess-1", "1042")
+    inbox_renames = [n for n in renamed if n.startswith(key)]
+    assert inbox_renames[-1] == f"{key}.json"
+    assert f"{key}.wav" in inbox_renames[:-1]
+    assert not [n for n in _inbox(wcfg) if n.endswith(".part")]
+
+
+@needs_ffmpeg
+def test_two_legs_of_one_session_export_as_one_conference(wcfg: WebexConfig, mp3_bytes) -> None:
+    legs = [_recording("rec-a", personality="ORIGINATING"), _recording("rec-b", personality="TERMINATING")]
+    result = _exporter(wcfg, FakeWebex(legs, mp3_bytes(1))).run_once()
+
+    assert len(result.exported) == 2
+    sidecars = [parse_sidecar(p.read_text(encoding="utf-8")) for p in sorted(wcfg.inbox.glob("*.json"))]
+    assert {s.conference_id for s in sidecars} == {"wxc-sess-1"}
+    assert {s.kind for s in sidecars} == {"conference"}
+    assert {s.line_owner.extension for s in sidecars} == {"1042", "2210"}
+
+
+@needs_ffmpeg
+def test_watcher_accepts_the_exported_pair(wcfg: WebexConfig, cfg: Config, mp3_bytes) -> None:
+    wcfg = wcfg.model_copy(update={"inbox": cfg.paths.inbox})
+    _exporter(wcfg, FakeWebex([_recording()], mp3_bytes(1))).run_once()
+    store = JobStore(cfg.paths.db_path)
+    store.init_schema()
+    try:
+        assert scan_once(cfg, store).enqueued == (job_key("wxc-sess-1", "1042"),)
+    finally:
+        store.close()
+
+
+def test_rejected_download_leaves_no_partial_drop_and_parks_after_max_attempts(wcfg: WebexConfig) -> None:
+    fake = FakeWebex([_recording()], b"")
+    fake.download_status = 404  # e.g. the temporary link expired
+
+    for _ in range(wcfg.max_attempts):
+        assert _exporter(wcfg, fake).run_once().failed == ("rec-1",)
+    assert _inbox(wcfg) == []
+
+    parked = _exporter(wcfg, fake).run_once()
+    assert parked.failed == () and parked.skipped == ("rec-1",)
+    assert len(fake.calls("GET", "/convergedRecordings/rec-1")) == wcfg.max_attempts * 2
+
+
+def test_server_error_aborts_the_poll_without_a_partial_drop(wcfg: WebexConfig) -> None:
+    fake = FakeWebex([_recording()], b"")
+    fake.download_status = 503
+    with pytest.raises(httpx.HTTPStatusError):
+        _exporter(wcfg, fake).run_once()
+    assert _inbox(wcfg) == []
+    # Transient: not counted against the recording, so it is retried in full next poll.
+    assert Ledger(wcfg.state_path).attempts("rec-1") == 0
+
+
+def test_download_does_not_send_the_token_to_another_host(wcfg: WebexConfig) -> None:
+    fake = FakeWebex([_recording()], b"")
+    fake.download_status = 404
+    _exporter(wcfg, fake).run_once()
+    download = next(r for r in fake.requests if r.url.host == "media.webex.test")
+    assert "Authorization" not in download.headers
+
+
+@needs_ffmpeg
+def test_delete_is_off_by_default(wcfg: WebexConfig, mp3_bytes) -> None:
+    fake = FakeWebex([_recording()], mp3_bytes(1))
+    _exporter(wcfg, fake).run_once()
+    assert fake.calls("DELETE", "") == []
+
+
+@needs_ffmpeg
+def test_delete_after_export_when_enabled(wcfg: WebexConfig, mp3_bytes) -> None:
+    fake = FakeWebex([_recording()], mp3_bytes(1))
+    _exporter(wcfg.model_copy(update={"delete_after_export": True}), fake).run_once()
+    assert len(fake.calls("DELETE", "/convergedRecordings/rec-1")) == 1
