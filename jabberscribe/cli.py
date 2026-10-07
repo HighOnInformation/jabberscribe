@@ -77,20 +77,25 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-def _check_ffmpeg() -> Check:
-    exe = shutil.which("ffmpeg")
+#: What a missing ffprobe costs: speaker labels need the channel count of a dual-track recording.
+FFPROBE_NOTE = "; dual-track calls fall back to an unlabelled downmix"
+
+
+def _check_tool(name: str, note: str = "") -> Check:
+    """`name -version` must run. `note` says what a failure costs."""
+    exe = shutil.which(name)
     if exe is None:
-        return Check("ffmpeg", False, "not found on PATH")
+        return Check(name, False, f"not found on PATH{note}")
     try:
         proc = subprocess.run(
             [exe, "-version"], capture_output=True, encoding="utf-8", errors="replace", timeout=15, check=False
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return Check("ffmpeg", False, f"{exe}: {exc}")
+        return Check(name, False, f"{exe}: {exc}{note}")
     if proc.returncode != 0:
-        return Check("ffmpeg", False, f"{exe} exited {proc.returncode}")
+        return Check(name, False, f"{exe} exited {proc.returncode}{note}")
     first_line = proc.stdout.splitlines()[0] if proc.stdout else exe
-    return Check("ffmpeg", True, first_line)
+    return Check(name, True, first_line)
 
 
 def _check_models(cfg: Config, client: httpx.Client) -> Check:
@@ -191,7 +196,8 @@ def _check_dir(name: str, path: Path) -> Check:
 def doctor(cfg: Config, client: httpx.Client) -> list[Check]:
     """Verify the environment. Creates missing directories as a side effect."""
     return [
-        _check_ffmpeg(),
+        _check_tool("ffmpeg"),
+        _check_tool("ffprobe", FFPROBE_NOTE),
         _check_models(cfg, client),
         _check_chat(cfg, client),
         _check_transcription(cfg, client),

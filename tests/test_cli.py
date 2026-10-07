@@ -580,3 +580,19 @@ def test_run_gives_each_phase_its_own_chance(cfg_file, fake_litellm, monkeypatch
 
     assert main(["--config", str(cfg_file), "run", "--once"]) == 1
     assert ran == ["scan", "settle", "process"]
+
+
+def test_doctor_fails_without_ffprobe_and_names_the_fallback(cfg, monkeypatch) -> None:
+    real_which = shutil.which
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None if name == "ffprobe" else real_which(name))
+
+    check = _checks(cfg, FakeLiteLLM())["ffprobe"]
+
+    assert not check.ok
+    assert "not found on PATH" in check.detail
+    assert "unlabelled downmix" in check.detail
+
+
+@needs_ffmpeg
+def test_doctor_passes_the_ffprobe_check_when_it_is_installed(cfg) -> None:
+    assert _checks(cfg, FakeLiteLLM())["ffprobe"].ok
