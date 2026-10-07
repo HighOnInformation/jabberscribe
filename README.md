@@ -19,7 +19,7 @@ jabberscribe --config D:/jabberscribe/jabberscribe.yaml doctor     # ffmpeg, pat
 jabberscribe --config ... process call.wav call.json   # one recording, end to end (only that job; exit 0 only if it is DONE)
 jabberscribe --config ... run                          # watch the inbox; purges once a day
 jabberscribe --config ... purge                        # delete past-retention audio and text now
-jabberscribe --config ... status                       # backlog, retrying and failed jobs (exit 1 if any failed)
+jabberscribe --config ... status                       # backlog, retrying and failed jobs (exit 1 if any failure is unresolved)
 jabberscribe --config ... retry <job_key>              # give a failed job fresh attempts
 jabberscribe --config ... retry --failed               # ... every failed job
 ```
