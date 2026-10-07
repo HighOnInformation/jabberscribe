@@ -3,7 +3,10 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from jabberscribe.audit import (
+    PURGE_FAILED_JOB,
     PURGED_AUDIO,
     PURGED_ORPHAN,
     PURGED_QUARANTINE,
@@ -11,7 +14,7 @@ from jabberscribe.audit import (
     PURGED_TEXT,
     SCRUBBED_METADATA,
 )
-from jabberscribe.jobs import SCRUBBED_SIDECAR
+from jabberscribe.jobs import DONE, FAILED, QUEUED, SCRUBBED_SIDECAR, WAITING
 from jabberscribe.output import RESULT_FILE, TEXT_FILES
 from jabberscribe.retention import purge
 from jabberscribe.watcher import scan_once
@@ -34,11 +37,12 @@ def _touch(path: Path, when: datetime, text: str = "x") -> Path:
     return path
 
 
-def _setup(cfg, store, audit, make_wav, make_sidecar, **sidecar_fields):
+def _setup(cfg, store, audit, make_wav, make_sidecar, status=DONE, **sidecar_fields):
     make_wav(cfg.paths.inbox / "r.wav")
     make_sidecar(cfg.paths.inbox / "r.json", call_id="r1", **sidecar_fields)
     scan_once(cfg, store, audit, min_age_seconds=0)
     _set_created(cfg, "r1_1042", STARTED)
+    store.set_status("r1_1042", status)
     job = store.get("r1_1042")
     for name in TEXT_FILES:
         (job.out_dir / name).write_text("x", encoding="utf-8")
@@ -85,7 +89,13 @@ def test_text_goes_after_365_days_and_metadata_is_scrubbed(cfg, store, audit, ma
     assert result.text_deleted == ("r1_1042",)
     assert not job.out_dir.exists()
     assert not work.exists()
-    assert store.get("r1_1042").sidecar_json == SCRUBBED_SIDECAR
+    scrubbed = store.get("r1_1042")
+    assert scrubbed.sidecar_json == SCRUBBED_SIDECAR
+    assert (scrubbed.started_at, scrubbed.created_at, scrubbed.status) == (
+        job.started_at,
+        STARTED.isoformat(timespec="seconds"),
+        DONE,
+    )
     actions = [e.action for e in audit.entries("r1_1042")]
     assert actions == [PURGED_AUDIO, PURGED_TEXT, SCRUBBED_METADATA]
     text_entry = audit.entries("r1_1042")[1]
@@ -117,12 +127,17 @@ def test_a_recorder_clock_in_the_past_does_not_delete_a_fresh_call(cfg, store, a
 
 def test_unparseable_start_is_never_deleted(cfg, store, audit, make_wav, make_sidecar) -> None:
     _setup(cfg, store, audit, make_wav, make_sidecar)
+    job_dir = cfg.paths.out_root / "bad"
+    work = cfg.paths.work_dir / "bad_1"
+    _touch(job_dir / "recording.wav", STARTED)
+    _touch(job_dir / RESULT_FILE, STARTED)
+    _touch(work / "segments.json", STARTED)
     store.create(
         job_key="bad_1",
         call_id="bad",
         conference_id=None,
-        audio_path=Path(cfg.paths.out_root / "bad" / "recording.wav"),
-        out_dir=Path(cfg.paths.out_root / "bad"),
+        audio_path=job_dir / "recording.wav",
+        out_dir=job_dir,
         sidecar_json="{}",
         started_at="garbage",
         duration_sec=1,
@@ -131,6 +146,9 @@ def test_unparseable_start_is_never_deleted(cfg, store, audit, make_wav, make_si
     result = purge(cfg, store, audit, now=STARTED + timedelta(days=1000))
 
     assert any("bad_1" in e and "cannot parse" in e for e in result.errors)
+    assert (job_dir / "recording.wav").is_file()
+    assert (job_dir / RESULT_FILE).is_file()
+    assert work.is_dir()
 
 
 def test_leftover_stt_copies_are_swept_after_a_day(cfg, store, audit) -> None:
@@ -162,3 +180,112 @@ def test_quarantine_and_inbox_orphans_follow_audio_retention(cfg, store, audit) 
     assert young_quarantine.exists() and waiting.exists()
     assert [e.action for e in audit.entries("bad")] == [PURGED_QUARANTINE, PURGED_QUARANTINE]
     assert [e.action for e in audit.entries("lost")] == [PURGED_ORPHAN]
+
+
+def test_queued_job_400_days_old_keeps_work_dir_and_stt(cfg, store, audit, make_wav, make_sidecar) -> None:
+    job, work = _setup(cfg, store, audit, make_wav, make_sidecar, status=QUEUED)
+    stt = _touch(work / "stt.ogg", STARTED)
+
+    purge(cfg, store, audit, now=STARTED + timedelta(days=400))
+
+    assert work.is_dir() and stt.exists()
+
+
+def test_waiting_stt_copy_survives_sweep_but_a_done_jobs_is_swept(cfg, store, audit, make_wav, make_sidecar) -> None:
+    now = STARTED + timedelta(days=10)
+    job, work = _setup(cfg, store, audit, make_wav, make_sidecar, status=WAITING)
+    waiting_stt = _touch(work / "stt.ogg", now - timedelta(days=2))
+    done_stt = _touch(cfg.paths.work_dir / "done_1" / "stt.ogg", now - timedelta(days=2))
+    store.create(
+        job_key="done_1",
+        call_id="done",
+        conference_id=None,
+        audio_path=cfg.paths.out_root / "d" / "recording.wav",
+        out_dir=cfg.paths.out_root / "d",
+        sidecar_json="{}",
+        started_at=STARTED.isoformat(),
+        duration_sec=1,
+    )
+    store.set_status("done_1", DONE)
+
+    purge(cfg, store, audit, now=now)
+
+    assert waiting_stt.exists()
+    assert not done_stt.exists()
+
+
+def test_active_job_past_audio_retention_is_failed_and_audited(cfg, store, audit, make_wav, make_sidecar) -> None:
+    job, work = _setup(cfg, store, audit, make_wav, make_sidecar, status=QUEUED)
+
+    result = purge(cfg, store, audit, now=STARTED + timedelta(days=91))
+
+    assert result.audio_deleted == ("r1_1042",)
+    assert not job.audio_path.exists()
+    failed = store.get("r1_1042")
+    assert failed.status == FAILED
+    assert failed.last_error == "audio purged by retention before processing"
+    assert [e.action for e in audit.entries("r1_1042")] == [PURGED_AUDIO, PURGE_FAILED_JOB]
+
+
+def test_partial_text_deletion_is_still_audited(cfg, store, audit, make_wav, make_sidecar, monkeypatch) -> None:
+    job, work = _setup(cfg, store, audit, make_wav, make_sidecar)
+    third = job.out_dir / TEXT_FILES[2]
+    real_unlink = Path.unlink
+
+    def flaky(self, *args, **kwargs):
+        if self == third:
+            raise PermissionError("locked")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", flaky)
+
+    result = purge(cfg, store, audit, now=STARTED + timedelta(days=366))
+
+    assert any("r1_1042" in e and "locked" in e for e in result.errors)
+    assert third.exists()
+    assert not (job.out_dir / TEXT_FILES[0]).exists() and not (job.out_dir / TEXT_FILES[1]).exists()
+    detail = [e.detail for e in audit.entries("r1_1042") if e.action == PURGED_TEXT][0]
+    assert TEXT_FILES[0] in detail and TEXT_FILES[1] in detail and TEXT_FILES[2] not in detail
+
+
+def test_one_failing_unlink_does_not_stop_other_jobs(cfg, store, audit, make_wav, make_sidecar, monkeypatch) -> None:
+    job, work = _setup(cfg, store, audit, make_wav, make_sidecar)
+    make_wav(cfg.paths.inbox / "s.wav")
+    make_sidecar(cfg.paths.inbox / "s.json", call_id="s1")
+    scan_once(cfg, store, audit, min_age_seconds=0)
+    _set_created(cfg, "s1_1042", STARTED)
+    store.set_status("s1_1042", DONE)
+    other = store.get("s1_1042")
+    real_unlink = Path.unlink
+
+    def flaky(self, *args, **kwargs):
+        if self == job.audio_path:
+            raise PermissionError("locked")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", flaky)
+
+    result = purge(cfg, store, audit, now=STARTED + timedelta(days=91))
+
+    assert job.audio_path.exists()
+    assert not other.audio_path.exists()
+    assert result.audio_deleted == ("s1_1042",)
+    assert any("r1_1042" in e for e in result.errors)
+
+
+def test_audit_failure_is_reported_and_purge_continues(cfg, store, audit, make_wav, make_sidecar, monkeypatch) -> None:
+    job, work = _setup(cfg, store, audit, make_wav, make_sidecar)
+
+    def broken(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(audit, "record", broken)
+
+    result = purge(cfg, store, audit, now=STARTED + timedelta(days=366))
+
+    assert any("r1_1042" in e and "database is locked" in e for e in result.errors)
+
+
+def test_naive_now_is_refused(cfg, store, audit) -> None:
+    with pytest.raises(ValueError, match="timezone"):
+        purge(cfg, store, audit, now=datetime(2027, 1, 1))

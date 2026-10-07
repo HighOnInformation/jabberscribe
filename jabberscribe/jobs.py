@@ -28,6 +28,9 @@ WAITING = "waiting"
 #: A conference copy whose meeting is processed by another job, its primary.
 GROUPED = "grouped"
 
+#: Jobs still in the pipeline: not finished, failed, or handed to another copy.
+ACTIVE: tuple[str, ...] = (QUEUED, RUNNING, WAITING)
+
 STAGE_ORDER: tuple[str, ...] = ("audio", "stt", "summarize", "output")
 
 #: Stored in PRAGMA user_version. A database written by any other version is refused.
@@ -280,6 +283,14 @@ class JobStore:
         cur = self._conn.execute(
             "UPDATE jobs SET status = ?, updated_at = ? WHERE job_key = ? AND status = ?",
             (status, utcnow(), job_key, RUNNING),
+        )
+        return cur.rowcount == 1
+
+    def fail(self, job_key: str, reason: str) -> bool:
+        """Fail a job that is still active (QUEUED, RUNNING or WAITING). Returns whether it applied."""
+        cur = self._conn.execute(
+            "UPDATE jobs SET status = ?, last_error = ?, updated_at = ? WHERE job_key = ? AND status IN (?, ?, ?)",
+            (FAILED, reason, utcnow(), job_key, *ACTIVE),
         )
         return cur.rowcount == 1
 

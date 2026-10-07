@@ -25,6 +25,7 @@ PURGED_STT_AUDIO = "purged_stt_audio"
 PURGED_QUARANTINE = "purged_quarantine"
 PURGED_ORPHAN = "purged_orphan"
 SCRUBBED_METADATA = "scrubbed_metadata"
+PURGE_FAILED_JOB = "purge_failed_job"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS audit_log (

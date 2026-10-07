@@ -379,6 +379,27 @@ def test_scrub_sidecar_once(tmp_path: Path) -> None:
     assert store.get("c1_1042").sidecar_json == SCRUBBED_SIDECAR
 
 
+@pytest.mark.parametrize("status", [QUEUED, RUNNING, WAITING])
+def test_fail_ends_any_active_job_with_a_reason(tmp_path: Path, status: str) -> None:
+    store = _store(tmp_path)
+    _create(store)
+    store.set_status("c1_1042", status)
+
+    assert store.fail("c1_1042", "gone") is True
+
+    job = store.get("c1_1042")
+    assert (job.status, job.last_error) == (FAILED, "gone")
+
+
+def test_fail_leaves_a_finished_job_alone(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _create(store)
+    store.set_status("c1_1042", DONE)
+
+    assert store.fail("c1_1042", "gone") is False
+    assert store.get("c1_1042").status == DONE
+
+
 def test_init_schema_refuses_an_older_database(tmp_path: Path) -> None:
     conn = sqlite3.connect(tmp_path / "js.db")
     conn.execute("CREATE TABLE jobs (call_id TEXT PRIMARY KEY)")

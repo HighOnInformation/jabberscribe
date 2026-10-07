@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -26,6 +27,7 @@ from pathlib import Path
 
 from jabberscribe.audio import STT_FILENAME
 from jabberscribe.audit import (
+    PURGE_FAILED_JOB,
     PURGED_AUDIO,
     PURGED_ORPHAN,
     PURGED_QUARANTINE,
@@ -35,13 +37,15 @@ from jabberscribe.audit import (
     AuditLog,
 )
 from jabberscribe.config import Config
-from jabberscribe.jobs import Job, JobStore
+from jabberscribe.jobs import ACTIVE, Job, JobStore
 from jabberscribe.output import TEXT_FILES
 
 log = logging.getLogger(__name__)
 
 #: A finished or failed job deletes its STT copy itself; anything older than this was left by a crash.
 STT_LEFTOVER_DAYS = 1
+
+AUDIO_PURGED_REASON = "audio purged by retention before processing"
 
 
 @dataclass(frozen=True)
@@ -68,17 +72,28 @@ def _file_age_days(path: Path, now: datetime) -> float:
     return (now - datetime.fromtimestamp(path.stat().st_mtime, UTC)) / timedelta(days=1)
 
 
-def _delete_text(job: Job, work: Path) -> list[str]:
+def _delete_text(job: Job, work: Path) -> tuple[list[str], list[str]]:
+    """Delete a job's text outputs and work dir. Returns (what was removed, errors).
+
+    A failure never hides what was already removed, so the caller can audit it.
+    """
     removed: list[str] = []
+    errors: list[str] = []
     for name in TEXT_FILES:
         path = job.out_dir / name
-        if path.is_file():
-            path.unlink()
-            removed.append(name)
-    if work.is_dir():
-        shutil.rmtree(work)
-        removed.append("work")
-    return removed
+        try:
+            if path.is_file():
+                path.unlink()
+                removed.append(name)
+        except OSError as exc:
+            errors.append(f"{job.job_key}: cannot delete {name}: {exc}")
+    try:
+        if work.is_dir():
+            shutil.rmtree(work)
+            removed.append("work")
+    except OSError as exc:
+        errors.append(f"{job.job_key}: cannot delete work dir: {exc}")
+    return removed, errors
 
 
 def _sweep(
@@ -96,48 +111,67 @@ def _sweep(
             errors.append(f"{path}: cannot delete: {exc}")
             continue
         swept.append(str(path))
-        audit.record(key_of(path), action, str(path))
+        try:
+            audit.record(key_of(path), action, str(path))
+        except sqlite3.Error as exc:
+            errors.append(f"{path}: deleted but not audited: {exc}")
     return swept, errors
 
 
 def purge(cfg: Config, store: JobStore, audit: AuditLog, now: datetime) -> PurgeResult:
-    """Delete aged audio and text, sweep leftovers, scrub old metadata. Every deletion is audited."""
+    """Delete aged audio and text, sweep leftovers, scrub old metadata. Every deletion is audited.
+
+    A job still in the pipeline (QUEUED, RUNNING, WAITING) keeps its work dir and STT copy. Its audio is
+    the one exception: retention wins, and the job is failed because it can no longer be processed.
+    """
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
     audio_deleted: list[str] = []
     text_deleted: list[str] = []
     errors: list[str] = []
+    jobs = store.list_all()
+    active_keys = {j.job_key for j in jobs if j.status in ACTIVE}
 
-    for job in store.list_all():
+    for job in jobs:
         age = _age_days(job, now)
         if age is None:
             errors.append(f"{job.job_key}: cannot parse started_at {job.started_at!r}, skipping")
             continue
+        active = job.job_key in active_keys
 
-        if age > cfg.retention.audio_days and job.audio_path.is_file():
-            try:
-                job.audio_path.unlink()
-            except OSError as exc:
-                errors.append(f"{job.job_key}: cannot delete audio: {exc}")
-            else:
-                audio_deleted.append(job.job_key)
-                audit.record(job.job_key, PURGED_AUDIO, str(job.audio_path))
+        try:
+            if age > cfg.retention.audio_days and job.audio_path.is_file():
+                try:
+                    job.audio_path.unlink()
+                except OSError as exc:
+                    errors.append(f"{job.job_key}: cannot delete audio: {exc}")
+                else:
+                    audio_deleted.append(job.job_key)
+                    audit.record(job.job_key, PURGED_AUDIO, str(job.audio_path))
+                    if active and store.fail(job.job_key, AUDIO_PURGED_REASON):
+                        log.warning("%s: audio purged by retention before processing; job failed", job.job_key)
+                        audit.record(job.job_key, PURGE_FAILED_JOB, AUDIO_PURGED_REASON)
 
-        if age > cfg.retention.text_days:
-            try:
-                removed = _delete_text(job, cfg.paths.work_dir / job.job_key)
-            except OSError as exc:
-                errors.append(f"{job.job_key}: cannot delete text: {exc}")
-                continue
-            if removed:
-                text_deleted.append(job.job_key)
-                audit.record(job.job_key, PURGED_TEXT, ", ".join(removed))
-            if store.scrub_sidecar(job.job_key):
-                audit.record(job.job_key, SCRUBBED_METADATA, "sidecar_json")
-            try:
-                job.out_dir.rmdir()
-            except OSError:
-                pass  # not empty (audio kept longer than text) or already gone
+            if age > cfg.retention.text_days and not active:
+                removed, text_errors = _delete_text(job, cfg.paths.work_dir / job.job_key)
+                errors += text_errors
+                if removed:
+                    text_deleted.append(job.job_key)
+                    audit.record(job.job_key, PURGED_TEXT, ", ".join(removed))
+                if text_errors:
+                    continue
+                if store.scrub_sidecar(job.job_key):
+                    audit.record(job.job_key, SCRUBBED_METADATA, "sidecar_json")
+                try:
+                    job.out_dir.rmdir()
+                except OSError:
+                    pass  # not empty (audio kept longer than text) or already gone
+        except sqlite3.Error as exc:
+            errors.append(f"{job.job_key}: database error: {exc}")
 
-    stt_copies = [p for d in cfg.paths.work_dir.glob("*") for p in d.glob(f"{STT_FILENAME}*")]
+    stt_copies = [
+        p for d in cfg.paths.work_dir.glob("*") if d.name not in active_keys for p in d.glob(f"{STT_FILENAME}*")
+    ]
     swept, sweep_errors = _sweep(stt_copies, STT_LEFTOVER_DAYS, now, PURGED_STT_AUDIO, audit, lambda p: p.parent.name)
     errors += sweep_errors
     for folder, action in ((cfg.paths.quarantine, PURGED_QUARANTINE), (cfg.paths.inbox, PURGED_ORPHAN)):
