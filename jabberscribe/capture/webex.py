@@ -14,11 +14,14 @@ docs/superpowers/specs/2026-10-08-webex-capture-design.md.
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
+import os
 import re
 import sqlite3
 import subprocess
+import time
 from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -524,3 +527,55 @@ class Exporter:
         except httpx.HTTPError as exc:
             # The export already stands; a stale cloud copy is not worth undoing it for.
             log.error("could not delete Webex copy of recording %s: %s", rec_id, exc.__class__.__name__)
+
+
+
+# --- entry point ------------------------------------------------------------
+
+
+def _poll(exporter: Exporter) -> bool:
+    try:
+        result = exporter.run_once()
+    except httpx.HTTPError as exc:
+        status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else exc.__class__.__name__
+        log.error("poll aborted (%s); retrying next poll", status)
+        return False
+    log.info("poll: %d exported, %d skipped, %d failed", len(result.exported), len(result.skipped), len(result.failed))
+    return True
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m jabberscribe.capture.webex", description=__doc__.splitlines()[0])
+    parser.add_argument("--config", type=Path, default=Path("config/webex.yaml"))
+    parser.add_argument("--once", action="store_true", help="poll once and exit")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    token = os.environ.get(TOKEN_ENV)
+    if not token:
+        log.error("%s is not set", TOKEN_ENV)
+        return 2
+    try:
+        cfg = load_webex_config(args.config)
+    except WebexConfigError as exc:
+        log.error("%s", exc)
+        return 2
+
+    client = WebexClient(cfg.base_url, token, timeout=cfg.timeout_seconds)
+    ledger = Ledger(cfg.state_path)
+    exporter = Exporter(cfg, client, ledger)
+    try:
+        if args.once:
+            return 0 if _poll(exporter) else 1
+        while True:
+            _poll(exporter)
+            time.sleep(cfg.poll_seconds)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        client.close()
+        ledger.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

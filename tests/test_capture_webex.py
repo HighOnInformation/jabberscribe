@@ -407,3 +407,23 @@ def test_delete_after_export_when_enabled(wcfg: WebexConfig, mp3_bytes) -> None:
     fake = FakeWebex([_recording()], mp3_bytes(1))
     _exporter(wcfg.model_copy(update={"delete_after_export": True}), fake).run_once()
     assert len(fake.calls("DELETE", "/convergedRecordings/rec-1")) == 1
+
+
+# --- CLI --------------------------------------------------------------------
+
+
+def test_cli_refuses_to_start_without_a_token(tmp_path: Path, monkeypatch, caplog) -> None:
+    from jabberscribe.capture.webex import TOKEN_ENV, main
+
+    path = tmp_path / "webex.yaml"
+    path.write_text(f"inbox: {tmp_path / 'i'}\nstate_path: {tmp_path / 's.db'}\nwork_dir: {tmp_path / 'w'}\n")
+    monkeypatch.delenv(TOKEN_ENV, raising=False)
+    assert main(["--config", str(path), "--once"]) == 2
+    assert TOKEN_ENV in caplog.text
+
+
+def test_cli_rejects_a_bad_config(tmp_path: Path, monkeypatch) -> None:
+    from jabberscribe.capture.webex import TOKEN_ENV, main
+
+    monkeypatch.setenv(TOKEN_ENV, "tok")
+    assert main(["--config", str(tmp_path / "missing.yaml"), "--once"]) == 2
