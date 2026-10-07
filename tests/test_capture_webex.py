@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -16,11 +17,13 @@ import pytest
 from jabberscribe.capture.webex import (
     MAX_WINDOW,
     Exporter,
+    ExportError,
     Ledger,
     Probe,
     WebexClient,
     WebexConfig,
     WebexConfigError,
+    _poll,
     load_webex_config,
     to_sidecar,
 )
@@ -120,6 +123,7 @@ def test_list_follows_link_next_and_sends_auth() -> None:
     assert all(r.headers["Authorization"] == "Bearer tok" for r in seen)
     first = parse_qs(urlparse(str(seen[0].url)).query)
     assert first["status"] == ["available"]
+    assert first["serviceType"] == ["calling"]
     assert first["from"] == ["2026-10-01T00:00:00.000Z"]
     assert first["to"] == ["2026-10-02T00:00:00.000Z"]
 
@@ -156,7 +160,7 @@ def test_list_raises_on_http_error() -> None:
 
 
 def test_call_maps_to_valid_v2_sidecar() -> None:
-    data = to_sidecar(_recording(), {"ownerName": "מאיר חדד"}, PROBE_STEREO, shared_session=False)
+    data = to_sidecar(_recording(), {"ownerName": "מאיר חדד"}, PROBE_STEREO, owners=1)
     sidecar = parse_sidecar(json.dumps(data, ensure_ascii=False))
     assert data["schema_version"] == 2
     assert sidecar.call_id == "wxc-sess-1"
@@ -173,7 +177,7 @@ def test_call_maps_to_valid_v2_sidecar() -> None:
 
 
 def test_started_at_carries_an_offset_and_is_the_session_start() -> None:
-    data = to_sidecar(_recording(), {}, PROBE_MONO, shared_session=False)
+    data = to_sidecar(_recording(), {}, PROBE_MONO, owners=1)
     started = datetime.fromisoformat(data["started_at"])
     assert started.utcoffset() is not None
     assert started == datetime(2026, 10, 7, 11, 3, 11, tzinfo=UTC)
@@ -182,29 +186,53 @@ def test_started_at_carries_an_offset_and_is_the_session_start() -> None:
 
 
 def test_terminating_leg_owner_is_the_called_party() -> None:
-    data = to_sidecar(_recording(personality="TERMINATING"), {}, PROBE_MONO, shared_session=False)
+    data = to_sidecar(_recording(personality="TERMINATING"), {}, PROBE_MONO, owners=1)
     assert data["line_owner"]["extension"] == "2210"
     assert data["line_owner"]["display_name"] == "Dana"
     assert data["parties"] == [{"extension": "1042", "user": None, "display_name": "Meir Hadad"}]
 
 
-def test_shared_session_becomes_a_conference() -> None:
-    data = to_sidecar(_recording(), {}, PROBE_MONO, shared_session=True)
+def test_more_than_two_owners_in_a_session_is_a_conference() -> None:
+    data = to_sidecar(_recording(), {}, PROBE_MONO, owners=3)
     sidecar = parse_sidecar(json.dumps(data))
     assert sidecar.kind == "conference"
     assert sidecar.conference_id == "wxc-sess-1"
 
 
+def test_two_owners_in_a_session_is_still_a_call() -> None:
+    data = to_sidecar(_recording(), {}, PROBE_MONO, owners=2)
+    assert data["kind"] == "call"
+    assert data["conference_id"] is None
+
+
+def test_party_fields_come_from_metadata_first_then_details() -> None:
+    meta = {
+        "serviceData": {
+            "personality": "TERMINATING",
+            "callingParty": {"name": "Meta Caller", "number": "3001"},
+            "calledParty": {"name": "Meta Callee", "number": "3002"},
+            "session": {"startTime": "2026-10-07T10:00:00.000Z"},
+        }
+    }
+    data = to_sidecar(_recording(), meta, PROBE_MONO, owners=1)
+    assert data["line_owner"]["extension"] == "3002"
+    assert data["parties"][0]["extension"] == "3001"
+    assert datetime.fromisoformat(data["started_at"]) == datetime(2026, 10, 7, 10, 0, tzinfo=UTC)
+    # Without metadata the details/list item is the fallback.
+    fallback = to_sidecar(_recording(), {}, PROBE_MONO, owners=1)
+    assert fallback["line_owner"]["extension"] == "1042"
+
+
 def test_more_than_two_metadata_participants_is_a_conference() -> None:
     meta = {"serviceData": {"participants": [{"number": "1"}, {"number": "2"}, {"number": "3"}]}}
-    data = to_sidecar(_recording(), meta, PROBE_MONO, shared_session=False)
+    data = to_sidecar(_recording(), meta, PROBE_MONO, owners=1)
     assert data["conference_id"] == "wxc-sess-1"
 
 
 def test_missing_numbers_fall_back_to_email_and_ids() -> None:
     rec = _recording()
     rec["serviceData"] = {}
-    data = to_sidecar(rec, {}, PROBE_MONO, shared_session=False)
+    data = to_sidecar(rec, {}, PROBE_MONO, owners=1)
     sidecar = parse_sidecar(json.dumps(data))
     assert sidecar.call_id == "wxc-rec-1"
     assert sidecar.line_owner.extension == "mhadad"
@@ -226,19 +254,25 @@ class FakeWebex:
         self.audio = audio
         self.requests: list[httpx.Request] = []
         self.download_status = 200
+        self.download_status_by_id: dict[str, int] = {}
+        self.metadata_extra: dict = {}
+        self.redirect_downloads = False
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         path = request.url.path
-        if request.url.host == "media.webex.test":
-            return httpx.Response(self.download_status, content=self.audio if self.download_status == 200 else b"")
+        if request.url.host == "media.webex.test" and self.redirect_downloads:
+            return httpx.Response(302, headers={"Location": f"https://storage.webex.test{path}"})
+        if request.url.host in ("media.webex.test", "storage.webex.test"):
+            status = self.download_status_by_id.get(path.strip("/").removesuffix(".mp3"), self.download_status)
+            return httpx.Response(status, content=self.audio if status == 200 else b"")
         if path.endswith("/admin/convergedRecordings"):
             return httpx.Response(200, json={"items": self.recordings})
         rec_id = path.split("/convergedRecordings/")[1].split("/")[0]
         if request.method == "DELETE":
             return httpx.Response(204)
         if path.endswith("/metadata"):
-            return httpx.Response(200, json={"ownerName": "Owner " + rec_id})
+            return httpx.Response(200, json={"ownerName": "Owner " + rec_id, **self.metadata_extra})
         item = next(r for r in self.recordings if r["id"] == rec_id)
         links = {"audioDownloadLink": f"{DOWNLOAD_HOST}/{rec_id}.mp3", "expiration": "2026-10-07T15:00:00Z"}
         return httpx.Response(200, json={**item, "temporaryDirectDownloadLinks": links})
@@ -346,15 +380,24 @@ def test_sidecar_is_renamed_into_place_last(wcfg: WebexConfig, mp3_bytes, monkey
 
 
 @needs_ffmpeg
-def test_two_legs_of_one_session_export_as_one_conference(wcfg: WebexConfig, mp3_bytes) -> None:
+def test_two_legs_of_an_internal_call_stay_separate_calls(wcfg: WebexConfig, mp3_bytes) -> None:
     legs = [_recording("rec-a", personality="ORIGINATING"), _recording("rec-b", personality="TERMINATING")]
     result = _exporter(wcfg, FakeWebex(legs, mp3_bytes(1))).run_once()
 
     assert len(result.exported) == 2
     sidecars = [parse_sidecar(p.read_text(encoding="utf-8")) for p in sorted(wcfg.inbox.glob("*.json"))]
-    assert {s.conference_id for s in sidecars} == {"wxc-sess-1"}
-    assert {s.kind for s in sidecars} == {"conference"}
+    assert {s.conference_id for s in sidecars} == {None}
+    assert {s.kind for s in sidecars} == {"call"}
     assert {s.line_owner.extension for s in sidecars} == {"1042", "2210"}
+    assert len({s.job_key for s in sidecars}) == 2
+
+
+@needs_ffmpeg
+def test_metadata_party_fields_win_over_details_in_an_export(wcfg: WebexConfig, mp3_bytes) -> None:
+    fake = FakeWebex([_recording()], mp3_bytes(1))
+    fake.metadata_extra = {"serviceData": {"callingParty": {"name": "M", "number": "3001"}}}
+    _exporter(wcfg, fake).run_once()
+    assert (wcfg.inbox / f"{job_key('wxc-sess-1', '3001')}.json").exists()
 
 
 @needs_ffmpeg
@@ -382,14 +425,120 @@ def test_rejected_download_leaves_no_partial_drop_and_parks_after_max_attempts(w
     assert len(fake.calls("GET", "/convergedRecordings/rec-1")) == wcfg.max_attempts * 2
 
 
-def test_server_error_aborts_the_poll_without_a_partial_drop(wcfg: WebexConfig) -> None:
-    fake = FakeWebex([_recording()], b"")
-    fake.download_status = 503
+def test_repeated_server_error_counts_attempts_and_does_not_block_others(wcfg: WebexConfig) -> None:
+    fake = FakeWebex([_recording("rec-bad", "s1"), _recording("rec-ok", "s2")], b"")
+    fake.download_status = 404  # rec-ok fails too (cheaply), but only rec-bad is a 5xx
+    fake.download_status_by_id["rec-bad"] = 503
+    for _ in range(wcfg.max_attempts):
+        assert _exporter(wcfg, fake).run_once().failed == ("rec-bad", "rec-ok")
+    ledger = Ledger(wcfg.state_path)
+    assert ledger.attempts("rec-bad") == wcfg.max_attempts
+    # rec-ok was still attempted on every poll despite rec-bad failing first.
+    assert ledger.attempts("rec-ok") == wcfg.max_attempts
+    assert _exporter(wcfg, fake).run_once().skipped == ("rec-bad", "rec-ok")
+
+
+@needs_ffmpeg
+def test_malformed_recording_is_counted_not_fatal(wcfg: WebexConfig, mp3_bytes) -> None:
+    bad = _recording("rec-bad", "s1", createTime="not-a-time", timeRecorded="also-bad")
+    bad["serviceData"]["session"] = {}
+    missing = _recording("rec-missing", "s2")
+    del missing["createTime"], missing["timeRecorded"]
+    missing["serviceData"]["session"] = {}
+    fake = FakeWebex([bad, missing, _recording("rec-ok", "s3")], mp3_bytes(1))
+    result = _exporter(wcfg, fake).run_once()
+    assert set(result.failed) == {"rec-bad", "rec-missing"}
+    assert Ledger(wcfg.state_path).attempts("rec-bad") == 1
+    assert Ledger(wcfg.state_path).attempts("rec-missing") == 1
+    assert len(result.exported) == 1
+
+
+def test_poll_loop_survives_unexpected_errors(caplog) -> None:
+    class Boom:
+        def run_once(self):
+            raise RuntimeError("boom https://media.webex.test/secret.mp3")
+
+    caplog.set_level(logging.INFO)
+    assert _poll(Boom()) is False  # type: ignore[arg-type]
+    assert "secret.mp3" not in caplog.text
+
+
+@needs_ffmpeg
+def test_download_follows_a_redirect_without_leaking_the_token(wcfg: WebexConfig, mp3_bytes) -> None:
+    fake = FakeWebex([_recording()], mp3_bytes(1))
+    fake.redirect_downloads = True
+    assert len(_exporter(wcfg, fake).run_once().exported) == 1
+    hops = [r for r in fake.requests if r.url.host in ("media.webex.test", "storage.webex.test")]
+    assert [r.url.host for r in hops] == ["media.webex.test", "storage.webex.test"]
+    assert all("Authorization" not in r.headers for r in hops)
+
+
+def test_failed_download_removes_the_part_file(tmp_path: Path) -> None:
+    dest = tmp_path / "a.mp3"
+    (tmp_path / "a.mp3.part").write_bytes(b"x")  # a stale part from a dead earlier try
     with pytest.raises(httpx.HTTPStatusError):
-        _exporter(wcfg, fake).run_once()
-    assert _inbox(wcfg) == []
-    # Transient: not counted against the recording, so it is retried in full next poll.
-    assert Ledger(wcfg.state_path).attempts("rec-1") == 0
+        _client(lambda request: httpx.Response(404)).download("https://media.webex.test/a.mp3", dest)
+    assert list(tmp_path.iterdir()) == []
+
+    with pytest.raises(ExportError):
+        _client(lambda request: httpx.Response(200, content=b"")).download("https://media.webex.test/a.mp3", dest)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_export_logs_never_contain_download_urls_or_the_token(
+    wcfg: WebexConfig, tmp_path: Path, monkeypatch, caplog
+) -> None:
+    import jabberscribe.capture.webex as webex
+
+    fake = FakeWebex([_recording()], b"")
+    fake.download_status = 404
+    cfg_path = tmp_path / "webex.yaml"
+    cfg_path.write_text(
+        f"inbox: {wcfg.inbox}\nstate_path: {wcfg.state_path}\nwork_dir: {wcfg.work_dir}\nbase_url: {BASE}\n"
+    )
+    monkeypatch.setenv(webex.TOKEN_ENV, "super-secret-token")
+    monkeypatch.setattr(
+        webex, "WebexClient", lambda base, token, **kw: WebexClient(base, token, transport=httpx.MockTransport(fake))
+    )
+    saved = {n: logging.getLogger(n).level for n in ("httpx", "httpcore")}
+    try:
+        with caplog.at_level(logging.INFO):
+            webex.main(["--config", str(cfg_path), "--once"])
+    finally:
+        for n, level in saved.items():
+            logging.getLogger(n).setLevel(level)
+    assert fake.calls("GET", "media.webex.test")  # the download really happened
+    assert "media.webex.test" not in caplog.text
+    assert "rec-1.mp3" not in caplog.text
+    assert "super-secret-token" not in caplog.text
+
+
+@needs_ffmpeg
+def test_crash_between_pair_write_and_ledger_mark_is_a_watcher_duplicate(
+    wcfg: WebexConfig, cfg: Config, mp3_bytes, monkeypatch
+) -> None:
+    wcfg = wcfg.model_copy(update={"inbox": cfg.paths.inbox})
+    fake = FakeWebex([_recording()], mp3_bytes(1))
+
+    def crash(self, recording_id: str, key: str) -> None:
+        raise RuntimeError("crash before ledger mark")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Ledger, "mark_done", crash)
+        with pytest.raises(RuntimeError):
+            _exporter(wcfg, fake).run_once()
+
+    key = job_key("wxc-sess-1", "1042")
+    store = JobStore(cfg.paths.db_path)
+    store.init_schema()
+    try:
+        assert scan_once(cfg, store).enqueued == (key,)  # the watcher took the first pair
+        again = _exporter(wcfg, fake).run_once()
+        assert again.exported == (key,)  # same key after the re-export
+        assert scan_once(cfg, store).skipped == (key,)  # discarded as a duplicate
+        assert _inbox(wcfg) == []
+    finally:
+        store.close()
 
 
 def test_download_does_not_send_the_token_to_another_host(wcfg: WebexConfig) -> None:

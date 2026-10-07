@@ -22,7 +22,6 @@ import re
 import sqlite3
 import subprocess
 import time
-from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -143,7 +142,13 @@ class WebexClient:
         """Yield every available recording created in [start, end), all pages, all windows."""
         for lo, hi in _windows(start, end):
             url: str | None = self._base_url + _LIST_PATH
-            params: dict | None = {"from": _iso_z(lo), "to": _iso_z(hi), "status": "available", "max": page_size}
+            params: dict | None = {
+                "from": _iso_z(lo),
+                "to": _iso_z(hi),
+                "status": "available",
+                "serviceType": "calling",
+                "max": page_size,
+            }
             while url:
                 response = self._get(url, params)
                 yield from response.json().get("items") or []
@@ -172,18 +177,22 @@ class WebexClient:
             # ASSUMPTION: the temporary link is self-authenticating; never leak the token to another host.
             del request.headers["Authorization"]
         part = dest.with_name(dest.name + ".part")
-        response = self._http.send(request, stream=True)
+        # httpx drops Authorization when a redirect leaves the origin (e.g. to a storage host).
+        response = self._http.send(request, stream=True, follow_redirects=True)
         try:
-            response.raise_for_status()
-            with part.open("wb") as out:
-                for chunk in response.iter_bytes():
-                    out.write(chunk)
-        finally:
-            response.close()
-        if part.stat().st_size == 0:
-            part.unlink()
-            raise ExportError("downloaded audio is empty")
-        part.replace(dest)
+            try:
+                response.raise_for_status()
+                with part.open("wb") as out:
+                    for chunk in response.iter_bytes():
+                        out.write(chunk)
+            finally:
+                response.close()
+            if part.stat().st_size == 0:
+                raise ExportError("downloaded audio is empty")
+            part.replace(dest)
+        except BaseException:
+            part.unlink(missing_ok=True)
+            raise
 
     def delete(self, recording_id: str) -> None:
         # ASSUMPTION: compliance hard delete takes an optional reason and comment in the body.
@@ -230,6 +239,27 @@ def _session_id(rec: dict) -> str:
     return str(sd.get("callSessionId") or sd.get("callId") or rec["id"])
 
 
+def _owner_key(rec: dict) -> str:
+    """Who owns this recording, for counting distinct owners within one session."""
+    return str(rec.get("ownerId") or rec.get("ownerEmail") or rec["id"])
+
+
+def _with_metadata_call_fields(rec: dict, meta: dict) -> dict:
+    """Overlay party, direction and session-start fields from the metadata response.
+
+    ASSUMPTION: GET /convergedRecordings/{id}/metadata carries serviceData
+    callingParty / calledParty / personality / session (the list and details
+    items may not). Metadata wins when it has a field; details/list is the
+    fallback. This is the one place to change once a real tenant shows where
+    the fields live.
+    """
+    meta_sd = _service_data(meta)
+    wanted = {k: meta_sd[k] for k in ("callingParty", "calledParty", "personality", "session") if meta_sd.get(k)}
+    if not wanted:
+        return rec
+    return {**rec, "serviceData": {**_service_data(rec), **wanted}}
+
+
 def _owner_and_other(rec: dict) -> tuple[dict, dict]:
     """(owner's party, other party) from the recorded leg's direction.
 
@@ -270,15 +300,19 @@ def _email_user(rec: dict) -> str | None:
     return email.split("@", 1)[0] if email else None
 
 
-def to_sidecar(rec: dict, meta: dict, probe: Probe, *, shared_session: bool) -> dict:
+def to_sidecar(rec: dict, meta: dict, probe: Probe, *, owners: int = 1) -> dict:
     """Map one recording (details item + metadata) to a v2 sidecar document.
 
-    `shared_session` is True when another recording in the same listing has the
-    same session id, i.e. several recorded legs of one call.
+    `owners` is how many distinct recording owners the listing shows for this
+    session. A conference needs positive evidence: more than two participants in
+    the metadata, or more than two owners. Two legs of one session are just the
+    two ends of a 1:1 call, which stays a call (spec v2 section 6: each line owner
+    gets their own copy).
     """
+    rec = _with_metadata_call_fields(rec, meta)
     session = _session_id(rec)
     call_id = f"wxc-{session}"
-    is_conference = shared_session or len(_participants(meta)) > 2
+    is_conference = owners > 2 or len(_participants(meta)) > 2
     owner, other = _owner_and_other(rec)
     user = _email_user(rec)
     # A pair without an extension is quarantined, so fall back to something that names the line.
@@ -439,14 +473,6 @@ class PollResult:
     failed: tuple[str, ...] = ()
 
 
-def _is_transient(exc: httpx.HTTPError) -> bool:
-    """Rate limits, server errors and network failures say nothing about the recording itself."""
-    if isinstance(exc, httpx.HTTPStatusError):
-        status = exc.response.status_code
-        return status == 429 or status >= 500
-    return True
-
-
 class Exporter:
     def __init__(
         self,
@@ -461,31 +487,41 @@ class Exporter:
         self._now = now
 
     def run_once(self) -> PollResult:
-        """One poll. Transient HTTP errors propagate: the poll stops and the next one retries."""
+        """One poll. Listing errors propagate; a bad recording is counted and the next one still runs."""
         end = self._now()
         start = end - timedelta(hours=self._cfg.lookback_hours)
         items = list(self._client.list_recordings(start, end, self._cfg.page_size))
-        sessions = Counter(_session_id(item) for item in items)
+        owners: dict[str, set[str]] = {}
+        for item in items:
+            try:
+                owners.setdefault(_session_id(item), set()).add(_owner_key(item))
+            except KeyError:
+                continue  # no id: the per-recording pass below counts it
         exported: list[str] = []
         skipped: list[str] = []
         failed: list[str] = []
 
         for item in items:
-            rec_id = item["id"]
+            rec_id = item.get("id")
+            if not rec_id:
+                log.error("listing returned a recording without an id; skipping it")
+                continue
             if self._ledger.is_settled(rec_id, self._cfg.max_attempts):
                 skipped.append(rec_id)
                 continue
             try:
-                key = self._export(item, shared_session=sessions[_session_id(item)] > 1)
+                key = self._export(item, owners=len(owners.get(_session_id(item), ())))
             except httpx.HTTPError as exc:
-                if _is_transient(exc) or not isinstance(exc, httpx.HTTPStatusError):
-                    raise
-                # Status only: the exception text carries the URL, and download URLs are credentials.
-                self._fail(rec_id, f"HTTP {exc.response.status_code}")
-                failed.append(rec_id)
-                continue
-            except ExportError as exc:
-                self._fail(rec_id, str(exc))
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code != 429:
+                    # Status only: the exception text carries the URL, and download URLs are credentials.
+                    # A 5xx counts as an attempt so one recording that always errors is parked.
+                    self._fail(rec_id, f"HTTP {exc.response.status_code}")
+                    failed.append(rec_id)
+                    continue
+                raise  # rate limit or network failure: not about this recording, stop the poll
+            except (ExportError, ValueError, KeyError, OSError) as exc:
+                # ValueError covers a bad timestamp and json.JSONDecodeError; KeyError a missing field.
+                self._fail(rec_id, f"{exc.__class__.__name__}: {exc}")
                 failed.append(rec_id)
                 continue
             self._ledger.mark_done(rec_id, key)
@@ -496,7 +532,7 @@ class Exporter:
 
         return PollResult(tuple(exported), tuple(skipped), tuple(failed))
 
-    def _export(self, item: dict, *, shared_session: bool) -> str:
+    def _export(self, item: dict, *, owners: int) -> str:
         rec_id = item["id"]
         details = self._client.details(rec_id)
         link = _audio_link(details)
@@ -506,7 +542,7 @@ class Exporter:
         try:
             self._client.download(link, mp3)
             probe = probe_audio(mp3, self._cfg.ffprobe)
-            sidecar = to_sidecar({**item, **details}, meta, probe, shared_session=shared_session)
+            sidecar = to_sidecar({**item, **details}, meta, probe, owners=owners)
             name = drop_name(sidecar)
             write_drop_pair(self._cfg.inbox, name, mp3, sidecar, self._cfg.ffmpeg)
         finally:
@@ -529,7 +565,6 @@ class Exporter:
             log.error("could not delete Webex copy of recording %s: %s", rec_id, exc.__class__.__name__)
 
 
-
 # --- entry point ------------------------------------------------------------
 
 
@@ -539,6 +574,10 @@ def _poll(exporter: Exporter) -> bool:
     except httpx.HTTPError as exc:
         status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else exc.__class__.__name__
         log.error("poll aborted (%s); retrying next poll", status)
+        return False
+    except Exception as exc:  # noqa: BLE001 - the daemon must outlive any one bad poll
+        # Class name only: exception text may embed a temporary download URL.
+        log.error("poll failed (%s); retrying next poll", exc.__class__.__name__)
         return False
     log.info("poll: %d exported, %d skipped, %d failed", len(result.exported), len(result.skipped), len(result.failed))
     return True
@@ -550,6 +589,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--once", action="store_true", help="poll once and exit")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # httpx logs every request URL at INFO, and download links are temporary credentials.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     token = os.environ.get(TOKEN_ENV)
     if not token:
