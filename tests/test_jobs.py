@@ -188,7 +188,7 @@ def test_next_stage_walks_fixed_order() -> None:
     while (stage := next_stage(stage)) is not None:
         walked.append(stage)
 
-    assert tuple(walked) == STAGE_ORDER == ("audio", "stt", "summarize", "output")
+    assert tuple(walked) == STAGE_ORDER == ("audio", "stt", "cues", "summarize", "output")
 
 
 def test_next_stage_rejects_unknown() -> None:

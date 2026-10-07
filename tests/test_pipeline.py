@@ -96,7 +96,7 @@ def test_result_records_stage_timings_and_latency(cfg, store, audit, make_wav, m
     run_once(cfg, store, FakeTranscriber(), FakeSummarizer())
 
     timings = _result(store.get(key))["timings"]
-    assert set(timings) == {"audio_sec", "stt_sec", "summarize_sec", "hangup_to_output_sec"}
+    assert set(timings) == {"audio_sec", "stt_sec", "cues_sec", "summarize_sec", "hangup_to_output_sec"}
     assert timings["hangup_to_output_sec"] > 0
 
 
@@ -161,7 +161,7 @@ def test_resume_after_crash_does_not_retranscribe(cfg, store, audit, make_wav, m
 
     _run_at(T0, cfg, store, FakeTranscriber(), ExplodingSummarizer())
     crashed = store.get(key)
-    assert (crashed.status, crashed.stage, crashed.attempts) == (QUEUED, "stt", 1)
+    assert (crashed.status, crashed.stage, crashed.attempts) == (QUEUED, "cues", 1)
     assert "summarize: summarizer bug" in crashed.last_error
 
     transcriber = FakeTranscriber()
@@ -181,7 +181,7 @@ def test_transient_summary_outage_resumes_at_summarize(cfg, store, audit, make_w
 
     _run_at(T0, cfg, store, FakeTranscriber(), DownSummarizer())
     waiting = store.get(key)
-    assert (waiting.status, waiting.stage, waiting.attempts, waiting.transient_failures) == (QUEUED, "stt", 0, 1)
+    assert (waiting.status, waiting.stage, waiting.attempts, waiting.transient_failures) == (QUEUED, "cues", 0, 1)
 
     transcriber = FakeTranscriber()
     _run_at(T0 + timedelta(minutes=1), cfg, store, transcriber, FakeSummarizer())
@@ -437,7 +437,7 @@ def test_summary_rejection_fails_only_the_primary_of_a_conference(cfg, store, au
     assert all(e.action != SUPERSEDED for k in keys for e in audit.entries(k))
 
     assert requeue_failed(store, longest) == longest
-    assert (store.get(longest).status, store.get(longest).stage) == (QUEUED, "stt")
+    assert (store.get(longest).status, store.get(longest).stage) == (QUEUED, "cues")
 
 
 def test_output_records_the_latency_for_status(cfg, store, audit, make_wav, make_sidecar) -> None:

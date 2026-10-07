@@ -6,6 +6,9 @@ reader never sees half a file.
 
 The Markdown bodies are wrapped in <div dir="rtl">: mixed Hebrew and English
 lines and tables render scrambled in most viewers without it.
+
+transcript.md is strict verbatim and never carries cues. transcript_cues.md is
+the same transcript with the bracket cues ([צחוק], ...) interleaved by time.
 """
 
 from __future__ import annotations
@@ -15,18 +18,21 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
+from jabberscribe.cues import Cue
 from jabberscribe.jobs import utcnow
 from jabberscribe.sidecar import Party, Sidecar
-from jabberscribe.stt import Segment, segment_line
+from jabberscribe.stt import Segment, format_ts, segment_line
 from jabberscribe.summarize import Summary
 
 TRANSCRIPT_FILE = "transcript.md"
 SUMMARY_FILE = "summary.md"
 ACTIONS_FILE = "actions.md"
+CUES_TRANSCRIPT_FILE = "transcript_cues.md"
 RESULT_FILE = "result.json"
-TEXT_FILES = (TRANSCRIPT_FILE, SUMMARY_FILE, ACTIONS_FILE, RESULT_FILE)
+TEXT_FILES = (TRANSCRIPT_FILE, CUES_TRANSCRIPT_FILE, SUMMARY_FILE, ACTIONS_FILE, RESULT_FILE)
 
 SUMMARY_UNAVAILABLE = "הסיכום אינו זמין עבור שיחה זו."
+CUES_UNAVAILABLE = "סימוני האירועים אינם זמינים עבור שיחה זו."
 
 #: A reader holding the destination open (Explorer preview, an editor, AV) blocks os.replace on Windows.
 REPLACE_ATTEMPTS = 5
@@ -67,6 +73,15 @@ def _render_transcript(segments: list[Segment]) -> str:
     return _rtl("# תמליל\n\n" + "\n\n".join(lines) + "\n")
 
 
+def _render_cues_transcript(segments: list[Segment], cues: list[Cue] | None) -> str:
+    # A cue sorts before a segment that starts at the same moment: "[צחוק]" then what was said.
+    lines = [(c.start, 0, f"[{format_ts(c.start)}] {c.label}") for c in cues or []]
+    lines += [(s.start, 1, segment_line(s)) for s in segments]
+    body = "\n\n".join(text for _, _, text in sorted(lines))
+    notice = "" if cues is not None else CUES_UNAVAILABLE + "\n\n"
+    return _rtl("# תמליל עם סימוני אירועים\n\n" + notice + body + "\n")
+
+
 def _render_summary(summary: Summary | None) -> str:
     return _rtl("# סיכום\n\n" + (summary.text if summary else SUMMARY_UNAVAILABLE) + "\n")
 
@@ -96,13 +111,16 @@ def write_outputs(
     models: dict[str, str],
     recording: Path,
     timings: dict[str, float] | None = None,
+    cues: list[Cue] | None = None,
 ) -> Path:
     """Write every output file for one call. Returns the result.json path.
 
     `timings` holds per-stage seconds and the hang-up-to-output latency (see pipeline.py).
     `summary_error` says why the summary is unavailable, when the reason is known.
+    `cues` is None when the cue layer is unavailable, [] when the call had no events.
     """
     write_atomic(out_dir / TRANSCRIPT_FILE, _render_transcript(segments))
+    write_atomic(out_dir / CUES_TRANSCRIPT_FILE, _render_cues_transcript(segments, cues))
     write_atomic(out_dir / SUMMARY_FILE, _render_summary(summary))
     write_atomic(out_dir / ACTIONS_FILE, _render_actions(summary))
     result = {
@@ -122,6 +140,8 @@ def write_outputs(
         "summary_error": None if summary is not None else summary_error,
         "summary": summary.text if summary else None,
         "action_items": [asdict(i) for i in summary.action_items] if summary else [],
+        "cues_available": cues is not None,
+        "cues": [asdict(c) for c in cues or []],
         "models": models,
         "timings": timings or {},
         "generated_at": utcnow(),

@@ -29,6 +29,7 @@ import httpx
 
 from jabberscribe.audit import LEGAL_HOLD_RELEASED, LEGAL_HOLD_SET, AuditLog
 from jabberscribe.config import Config, ConfigError, load_config
+from jabberscribe.cues import Tagger, load_tagger, unavailable_reason
 from jabberscribe.group import requeue_failed, settle
 from jabberscribe.health import heartbeat_path, latency_summary, read_heartbeat, write_heartbeat
 from jabberscribe.jobs import DONE, FAILED, GROUPED, QUEUED, RUNNING, WAITING, JobStore, SchemaError
@@ -165,6 +166,12 @@ def _check_vocabulary(cfg: Config) -> Check:
     return Check("stt.vocabulary_file", True, f"{path}: {len(vocabulary.split(', '))} terms")
 
 
+def _check_cues(cfg: Config) -> Check:
+    """Information only: the cue layer is optional, so a missing tagger never fails doctor."""
+    reason = unavailable_reason(cfg.cues)
+    return Check("cues", True, "tagger available" if reason is None else f"skipped: {reason}")
+
+
 def _check_dir(name: str, path: Path) -> Check:
     try:
         path.mkdir(parents=True, exist_ok=True)
@@ -187,6 +194,7 @@ def doctor(cfg: Config, client: httpx.Client) -> list[Check]:
         _check_chat(cfg, client),
         _check_transcription(cfg, client),
         _check_vocabulary(cfg),
+        _check_cues(cfg),
         _check_dir("paths.drop_root/inbox", cfg.paths.inbox),
         _check_dir("paths.drop_root/quarantine", cfg.paths.quarantine),
         _check_dir("paths.work_dir", cfg.paths.work_dir),
@@ -210,10 +218,10 @@ def _open(cfg: Config) -> tuple[JobStore, AuditLog]:
     return store, audit
 
 
-def _workers(cfg: Config, client: httpx.Client) -> tuple[LiteLLMTranscriber, LiteLLMSummarizer]:
+def _workers(cfg: Config, client: httpx.Client) -> tuple[LiteLLMTranscriber, LiteLLMSummarizer, Tagger | None]:
     prompt = build_prompt(_read_vocabulary(cfg))
     summarizer = LiteLLMSummarizer(client, cfg.summary.model, cfg.summary.max_chunk_chars)
-    return LiteLLMTranscriber(client, cfg.stt.model, prompt), summarizer
+    return LiteLLMTranscriber(client, cfg.stt.model, prompt), summarizer, load_tagger(cfg.cues)
 
 
 def _process(cfg: Config, store: JobStore, audit: AuditLog, audio: Path, sidecar_path: Path) -> int:
@@ -243,7 +251,8 @@ def _process(cfg: Config, store: JobStore, audit: AuditLog, audio: Path, sidecar
         settle(immediate, store, audit, datetime.now(UTC), conference_id=job.conference_id)
         job = store.get(key)
     target_key = job.grouped_into or key
-    run_job(target_key, cfg, store, *_workers(cfg, make_client(cfg.litellm)))
+    transcriber, summarizer, tagger = _workers(cfg, make_client(cfg.litellm))
+    run_job(target_key, cfg, store, transcriber, summarizer, tagger=tagger)
     target = store.get(target_key)
     print(f"{key}: {target.status} -> {target.out_dir}")
     return 0 if target.status == DONE else 1
@@ -261,7 +270,7 @@ def _report_purge(cfg: Config, store: JobStore, audit: AuditLog) -> int:
 
 
 def _serve(cfg: Config, store: JobStore, audit: AuditLog, once: bool) -> int:
-    transcriber, summarizer = _workers(cfg, make_client(cfg.litellm))
+    transcriber, summarizer, tagger = _workers(cfg, make_client(cfg.litellm))
     last_purge: date | None = None
     polls = 0
     while True:
@@ -269,7 +278,7 @@ def _serve(cfg: Config, store: JobStore, audit: AuditLog, once: bool) -> int:
         phases = (
             ("scan", lambda: scan_once(cfg, store, audit)),
             ("settle", lambda: settle(cfg, store, audit, _utcnow())),
-            ("process", lambda: run_once(cfg, store, transcriber, summarizer)),
+            ("process", lambda: run_once(cfg, store, transcriber, summarizer, tagger=tagger)),
         )
         for name, phase in phases:
             try:

@@ -1,8 +1,11 @@
 """Stage orchestration.
 
-Stages run in the fixed order audio -> stt -> summarize -> output, and each one
-checkpoints in the job store. A restart resumes at the first incomplete stage,
-so a crash after transcription never transcribes again.
+Stages run in the fixed order audio -> stt -> cues -> summarize -> output, and
+each one checkpoints in the job store. A restart resumes at the first
+incomplete stage, so a crash after transcription never transcribes again.
+
+The cues stage never fails a job: without a tagger, or when tagging fails,
+the call goes out with its cue layer marked unavailable.
 
 Retry policy. Every failure schedules the next try with exponential backoff
 (30 s, doubling, capped at 30 min, counted over all failures) from the moment
@@ -33,6 +36,7 @@ from pathlib import Path
 
 from jabberscribe.audio import STT_GLOB
 from jabberscribe.config import Config
+from jabberscribe.cues import Cue, Tagger
 from jabberscribe.group import owners_for
 from jabberscribe.jobs import DONE, FAILED, Job, JobStore, next_stage
 from jabberscribe.llm import TransientError
@@ -51,6 +55,7 @@ BACKOFF_CAP_SECONDS = 1800
 SEGMENTS_FILE = "segments.json"
 SUMMARY_JSON = "summary.json"
 TIMINGS_FILE = "timings.json"
+CUES_JSON = "cues.json"
 
 
 def backoff(attempts: int) -> timedelta:
@@ -64,6 +69,31 @@ def _write_segments(path: Path, segments: list[Segment]) -> None:
 
 def _read_segments(path: Path) -> list[Segment]:
     return [Segment(**s) for s in json.loads(path.read_text(encoding="utf-8"))]
+
+
+def _write_cues(path: Path, cues: list[Cue] | None) -> None:
+    payload = None if cues is None else [asdict(c) for c in cues]
+    write_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _read_cues(path: Path) -> list[Cue] | None:
+    """None when the layer is unavailable -- including a job that passed the cues stage before it existed."""
+    if not path.is_file():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return None if data is None else [Cue(**c) for c in data]
+
+
+def _tag(tagger: Tagger | None, audio: Path, job_key: str) -> list[Cue] | None:
+    """The recording's cues, or None when there is no tagger or it fails. Cues never fail a job."""
+    if tagger is None:
+        log.info("%s: no tagger; cues skipped", job_key)
+        return None
+    try:
+        return tagger.tag(audio)
+    except Exception:
+        log.exception("%s: tagging failed; the call goes out without cues", job_key)
+        return None
 
 
 def _summarize(summarizer: Summarizer, segments: list[Segment]) -> tuple[Summary | None, str | None]:
@@ -113,6 +143,7 @@ def process_job(
     store: JobStore,
     transcriber: Transcriber,
     summarizer: Summarizer,
+    tagger: Tagger | None = None,
 ) -> Path:
     """Run `job` from its checkpoint to the end. Returns the result.json path.
 
@@ -123,6 +154,7 @@ def process_job(
     segments_path = work / SEGMENTS_FILE
     summary_path = work / SUMMARY_JSON
     timings_path = work / TIMINGS_FILE
+    cues_path = work / CUES_JSON
     stage = job.stage
 
     try:
@@ -137,6 +169,8 @@ def process_job(
                 inputs = stt_inputs(job.audio_path, work, sidecar, cfg.stt)
                 _write_segments(segments_path, transcribe_inputs(transcriber, inputs))
                 _delete_stt_audio(work)
+            elif stage == "cues":
+                _write_cues(cues_path, _tag(tagger, job.audio_path, job.job_key))
             elif stage == "summarize":
                 _write_summary(summary_path, *_summarize(summarizer, _read_segments(segments_path)))
             elif stage == "output":
@@ -144,6 +178,7 @@ def process_job(
                 # Read the checkpoints first: a missing one is a real failure, not an outage.
                 segments = _read_segments(segments_path)
                 summary, summary_error = _read_summary(summary_path)
+                cues = _read_cues(cues_path)
                 owners = owners_for(job, store)
                 try:
                     write_outputs(
@@ -156,6 +191,7 @@ def process_job(
                         models={"stt": cfg.stt.model, "summary": cfg.summary.model},
                         recording=job.audio_path,
                         timings=timings,
+                        cues=cues,
                     )
                 except OSError as exc:
                     # A file locked or a share unavailable on the output side is
@@ -192,9 +228,10 @@ def _run(
     transcriber: Transcriber,
     summarizer: Summarizer,
     clock: Callable[[], datetime],
+    tagger: Tagger | None = None,
 ) -> None:
     try:
-        process_job(job, cfg, store, transcriber, summarizer)
+        process_job(job, cfg, store, transcriber, summarizer, tagger)
     except Exception as exc:
         failed = store.get(job.job_key)
         attempts = failed.attempts
@@ -225,6 +262,7 @@ def run_once(
     summarizer: Summarizer,
     now: datetime | None = None,
     clock: Callable[[], datetime] = _utcnow,
+    tagger: Tagger | None = None,
 ) -> int:
     """Process every job that is due once. Returns how many were attempted.
 
@@ -235,7 +273,7 @@ def run_once(
     processed = 0
     while (job := store.claim_next(moment)) is not None:
         processed += 1
-        _run(job, cfg, store, transcriber, summarizer, clock)
+        _run(job, cfg, store, transcriber, summarizer, clock, tagger)
     return processed
 
 
@@ -246,10 +284,11 @@ def run_job(
     transcriber: Transcriber,
     summarizer: Summarizer,
     clock: Callable[[], datetime] = _utcnow,
+    tagger: Tagger | None = None,
 ) -> bool:
     """Process one job now, due or not (the `process` command). Returns False if it was not runnable."""
     job = store.claim(job_key)
     if job is None:
         return False
-    _run(job, cfg, store, transcriber, summarizer, clock)
+    _run(job, cfg, store, transcriber, summarizer, clock, tagger)
     return True

@@ -31,7 +31,7 @@ GROUPED = "grouped"
 #: Jobs still in the pipeline: not finished, failed, or handed to another copy.
 ACTIVE: tuple[str, ...] = (QUEUED, RUNNING, WAITING)
 
-STAGE_ORDER: tuple[str, ...] = ("audio", "stt", "summarize", "output")
+STAGE_ORDER: tuple[str, ...] = ("audio", "stt", "cues", "summarize", "output")
 
 #: The checkpoint of a job that failed in the audio or STT stage: a failure of that copy's recording.
 COPY_STAGES: tuple[str, ...] = (QUEUED, "audio")
