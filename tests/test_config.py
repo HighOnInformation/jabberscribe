@@ -37,6 +37,7 @@ def test_minimal_config_loads_with_defaults(tmp_path: Path) -> None:
     assert cfg.stt.model == "whisper-he"
     assert cfg.stt.vocabulary_file is None
     assert cfg.summary.model == "gemma-3"
+    assert cfg.summary.max_chunk_chars == 12000
     assert (cfg.retention.audio_days, cfg.retention.text_days) == (90, 365)
 
 

@@ -1,26 +1,44 @@
 """Meeting summary and action items via the LiteLLM chat route.
 
-A summary failure must never cost the user their transcript: on a transport
-error or unusable output the request is retried once, then the call carries on
-with the summary marked unavailable.
+A summary failure must never cost the user their transcript. Failures split
+three ways:
+
+- Unusable model output (not JSON, wrong shape, empty content): retried once,
+  then the call carries on with the summary marked unavailable.
+- LiteLLM down or overloaded: TransientError, so the job retries later with
+  the transcript already checkpointed. A two-minute Gemma restart must not
+  cost a summary forever.
+- Any other 4xx (wrong model name, bad key, rejected parameter): SummaryError,
+  so the job fails loudly instead of shipping "unavailable" for every call.
+
+The instructions travel in the user message: Gemma 1 and 2 chat templates
+reject a system role. Transcripts longer than max_chunk_chars are summarized
+per chunk, then the chunk summaries are merged; action items are the union of
+the chunks' items, each keeping its own source_ts.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
 import httpx
 from pydantic import BaseModel, Field
 
+from jabberscribe.llm import post
 from jabberscribe.stt import Segment, format_ts
 
 log = logging.getLogger(__name__)
 
 ATTEMPTS = 2
+#: Explicit, so the server default cannot cut the JSON answer off mid-object.
+MAX_TOKENS = 2048
+#: How much of an unusable answer goes into the log.
+LOG_CHARS = 300
 
-SYSTEM_PROMPT = """You summarize Hebrew business phone calls and meetings from a timestamped transcript.
+INSTRUCTIONS = """You summarize Hebrew business phone calls and meetings from a timestamped transcript.
 Write in Hebrew. Keep English technical terms exactly as spoken.
 Return only a JSON object with this shape:
 {"summary": "<concise Hebrew summary of the call>",
@@ -30,6 +48,15 @@ Rules:
 - owner and due: fill them only when explicitly stated in the call; otherwise null. Never guess.
 - source_ts: the timestamp of the transcript line the item comes from, copied exactly.
 - If there are no action items, return an empty list."""
+
+MERGE_INSTRUCTIONS = """You merge the partial summaries of one Hebrew call, given in order, into one summary.
+Write in Hebrew. Keep English technical terms exactly as written.
+Return only a JSON object with this shape:
+{"summary": "<concise Hebrew summary of the whole call>"}"""
+
+
+class SummaryError(RuntimeError):
+    """LiteLLM rejected the summary request (4xx other than 429). Retrying will not help."""
 
 
 @dataclass(frozen=True)
@@ -62,11 +89,37 @@ class _SummaryModel(BaseModel):
     action_items: list[_ItemModel]
 
 
+class _MergeModel(BaseModel):
+    summary: str = Field(min_length=1)
+
+
 def transcript_text(segments: list[Segment]) -> str:
     return "\n".join(f"[{format_ts(s.start)}] {s.text}" for s in segments)
 
 
-def _strip_fences(content: str) -> str:
+def chunk_segments(segments: list[Segment], max_chars: int) -> list[list[Segment]]:
+    """Split into consecutive chunks whose transcript text stays within max_chars.
+
+    A single segment longer than max_chars still gets a chunk of its own.
+    """
+    if len(transcript_text(segments)) <= max_chars:
+        return [segments]
+    chunks: list[list[Segment]] = []
+    current: list[Segment] = []
+    size = 0
+    for segment in segments:
+        line = len(transcript_text([segment])) + 1
+        if current and size + line > max_chars:
+            chunks.append(current)
+            current, size = [], 0
+        current.append(segment)
+        size += line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def strip_fences(content: str) -> str:
     text = content.strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1] if "\n" in text else ""
@@ -84,7 +137,7 @@ def _blank_to_none(value: str | None) -> str | None:
 
 def parse_summary(content: str) -> Summary:
     """Validate the model's answer. Raises ValueError when it is unusable."""
-    model = _SummaryModel.model_validate_json(_strip_fences(content))
+    model = _SummaryModel.model_validate_json(strip_fences(content))
     return Summary(
         text=model.summary.strip(),
         action_items=tuple(
@@ -94,34 +147,77 @@ def parse_summary(content: str) -> Summary:
     )
 
 
+def _parse_merge(content: str) -> str:
+    return _MergeModel.model_validate_json(strip_fences(content)).summary.strip()
+
+
+def _union(parts: list[Summary]) -> tuple[ActionItem, ...]:
+    items: list[ActionItem] = []
+    for part in parts:
+        items.extend(i for i in part.action_items if i not in items)
+    return tuple(items)
+
+
 class LiteLLMSummarizer:
-    def __init__(self, client: httpx.Client, model: str) -> None:
+    def __init__(self, client: httpx.Client, model: str, max_chunk_chars: int = 12000) -> None:
         self._client = client
         self._model = model
+        self._max_chunk_chars = max_chunk_chars
 
     def summarize(self, segments: list[Segment]) -> Summary | None:
+        """None means the model's output stayed unusable; transport and 4xx errors raise."""
         if not segments:
             return None
-        transcript = transcript_text(segments)
+        chunks = chunk_segments(segments, self._max_chunk_chars)
+        parts: list[Summary] = []
+        for index, chunk in enumerate(chunks, start=1):
+            part = self._ask(INSTRUCTIONS, "Transcript:\n" + transcript_text(chunk), parse_summary)
+            if part is None:
+                log.warning("summary chunk %d/%d stayed unusable; summary unavailable", index, len(chunks))
+                return None
+            parts.append(part)
+        if len(parts) == 1:
+            return parts[0]
+        numbered = "\n\n".join(f"Part {i}:\n{p.text}" for i, p in enumerate(parts, start=1))
+        merged = self._ask(MERGE_INSTRUCTIONS, "Partial summaries:\n" + numbered, _parse_merge)
+        if merged is None:
+            return None
+        return Summary(merged, _union(parts))
+
+    def _ask[T](self, instructions: str, body: str, parse: Callable[[str], T]) -> T | None:
         for attempt in range(1, ATTEMPTS + 1):
+            content: str | None = None
             try:
-                return parse_summary(self._complete(transcript))
-            except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
-                log.warning("summary attempt %d/%d failed: %s", attempt, ATTEMPTS, exc)
+                content = self._complete(f"{instructions}\n\n{body}")
+                return parse(content)
+            except (ValueError, KeyError, IndexError, TypeError) as exc:
+                log.warning(
+                    "summary attempt %d/%d returned unusable output: %s; raw: %r",
+                    attempt,
+                    ATTEMPTS,
+                    exc,
+                    (content or "")[:LOG_CHARS],
+                )
         return None
 
-    def _complete(self, transcript: str) -> str:
-        response = self._client.post(
-            "/v1/chat/completions",
-            json={
-                "model": self._model,
-                "temperature": 0.2,
-                "response_format": {"type": "json_object"},
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": transcript},
-                ],
-            },
-        )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
+    def _complete(self, prompt: str) -> str:
+        """One chat completion. Raises ValueError when the answer has no text content."""
+        try:
+            response = post(
+                self._client,
+                "/v1/chat/completions",
+                json={
+                    "model": self._model,
+                    "temperature": 0.2,
+                    "max_tokens": MAX_TOKENS,
+                    "response_format": {"type": "json_object"},
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+            )
+        except httpx.HTTPStatusError as exc:
+            raise SummaryError(f"summary request rejected: {exc}") from exc
+        content = response.json()["choices"][0]["message"]["content"]
+        if not isinstance(content, str) or not content.strip():
+            # A refusal or an empty completion: unusable output, not a crash.
+            raise ValueError(f"model returned no text content: {content!r}")
+        return content

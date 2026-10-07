@@ -3,8 +3,18 @@ import json
 import httpx
 import pytest
 
+from jabberscribe.llm import TransientError
 from jabberscribe.stt import Segment
-from jabberscribe.summarize import ActionItem, LiteLLMSummarizer, Summary, parse_summary, transcript_text
+from jabberscribe.summarize import (
+    MAX_TOKENS,
+    ActionItem,
+    LiteLLMSummarizer,
+    Summary,
+    SummaryError,
+    chunk_segments,
+    parse_summary,
+    transcript_text,
+)
 
 SEGMENTS = [Segment(0.0, 2.0, "שלום, מה שלומך"), Segment(65.0, 70.0, "דנה תשלח את הדוח עד יום חמישי")]
 
@@ -28,14 +38,16 @@ class Server:
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(json.loads(request.content))
         response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
         if isinstance(response, httpx.Response):
             return response
         return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": response}}]})
 
 
-def _summarizer(server: Server) -> LiteLLMSummarizer:
+def _summarizer(server: Server, max_chunk_chars: int = 12000) -> LiteLLMSummarizer:
     client = httpx.Client(base_url="http://litellm.test", transport=httpx.MockTransport(server))
-    return LiteLLMSummarizer(client, model="gemma-3")
+    return LiteLLMSummarizer(client, model="gemma-3", max_chunk_chars=max_chunk_chars)
 
 
 def test_transcript_text_is_timestamped_lines() -> None:
@@ -54,7 +66,8 @@ def test_returns_summary_and_action_items() -> None:
     )
 
 
-def test_request_carries_model_json_mode_and_transcript() -> None:
+def test_request_has_no_system_role_and_caps_tokens() -> None:
+    """Gemma 1 and 2 chat templates reject a system message."""
     server = Server(GOOD_JSON)
 
     _summarizer(server).summarize(SEGMENTS)
@@ -62,8 +75,10 @@ def test_request_carries_model_json_mode_and_transcript() -> None:
     request = server.requests[0]
     assert request["model"] == "gemma-3"
     assert request["response_format"] == {"type": "json_object"}
-    assert request["messages"][0]["role"] == "system"
-    assert "[00:01:05] דנה תשלח" in request["messages"][1]["content"]
+    assert request["max_tokens"] == MAX_TOKENS
+    assert [m["role"] for m in request["messages"]] == ["user"]
+    assert "Return only a JSON object" in request["messages"][0]["content"]
+    assert "[00:01:05] דנה תשלח" in request["messages"][0]["content"]
 
 
 def test_retries_once_after_unusable_output() -> None:
@@ -73,17 +88,38 @@ def test_retries_once_after_unusable_output() -> None:
     assert len(server.requests) == 2
 
 
-def test_gives_up_after_two_unusable_answers() -> None:
+def test_gives_up_after_two_unusable_answers_and_logs_them(caplog) -> None:
     server = Server("nope", "still nope")
+
+    assert _summarizer(server).summarize(SEGMENTS) is None
+    assert len(server.requests) == 2
+    assert "still nope" in caplog.text
+
+
+def test_null_content_is_unusable_output_not_a_crash() -> None:
+    """A refusal or empty completion comes back as content: null."""
+    server = Server(None, "")
 
     assert _summarizer(server).summarize(SEGMENTS) is None
     assert len(server.requests) == 2
 
 
-def test_server_errors_degrade_to_none() -> None:
-    server = Server(httpx.Response(503), httpx.Response(503))
+@pytest.mark.parametrize("status", [429, 500, 503])
+def test_server_overload_is_transient(status: int) -> None:
+    with pytest.raises(TransientError):
+        _summarizer(Server(httpx.Response(status))).summarize(SEGMENTS)
 
-    assert _summarizer(server).summarize(SEGMENTS) is None
+
+def test_unreachable_server_is_transient() -> None:
+    with pytest.raises(TransientError):
+        _summarizer(Server(httpx.ConnectError("refused"))).summarize(SEGMENTS)
+
+
+@pytest.mark.parametrize("status", [400, 401, 404])
+def test_rejected_request_fails_loudly(status: int) -> None:
+    """A wrong model name must not quietly ship "summary unavailable" for every call."""
+    with pytest.raises(SummaryError, match=str(status)):
+        _summarizer(Server(httpx.Response(status))).summarize(SEGMENTS)
 
 
 def test_empty_transcript_skips_the_request() -> None:
@@ -91,6 +127,46 @@ def test_empty_transcript_skips_the_request() -> None:
 
     assert _summarizer(server).summarize([]) is None
     assert server.requests == []
+
+
+def test_short_transcript_is_one_chunk() -> None:
+    assert chunk_segments(SEGMENTS, 12000) == [SEGMENTS]
+
+
+def test_long_transcript_is_split_on_segment_boundaries() -> None:
+    segments = [Segment(float(i), float(i + 1), "מילה " * 10) for i in range(10)]
+
+    chunks = chunk_segments(segments, 200)
+
+    assert [s for chunk in chunks for s in chunk] == segments
+    assert len(chunks) > 1
+    assert all(len(transcript_text(chunk)) <= 200 for chunk in chunks)
+
+
+def test_long_transcript_is_summarized_per_chunk_then_merged() -> None:
+    first = {"summary": "חלק ראשון.", "action_items": [GOOD["action_items"][1]]}
+    second = {"summary": "חלק שני.", "action_items": [GOOD["action_items"][0], GOOD["action_items"][1]]}
+    merged = {"summary": "סיכום מאוחד."}
+    server = Server(*(json.dumps(d, ensure_ascii=False) for d in (first, second, merged)))
+
+    summary = _summarizer(server, max_chunk_chars=40).summarize(SEGMENTS)
+
+    assert summary == Summary(
+        "סיכום מאוחד.",
+        (
+            ActionItem("לבדוק את ה-API", None, None, "00:00:00"),
+            ActionItem("לשלוח את הדוח", "דנה", "יום חמישי", "00:01:05"),
+        ),
+    )
+    assert "שלום, מה שלומך" in server.requests[0]["messages"][0]["content"]
+    assert "דנה תשלח" in server.requests[1]["messages"][0]["content"]
+    assert "חלק ראשון." in server.requests[2]["messages"][0]["content"]
+
+
+def test_an_unusable_chunk_makes_the_summary_unavailable() -> None:
+    server = Server("nope", "still nope")
+
+    assert _summarizer(server, max_chunk_chars=40).summarize(SEGMENTS) is None
 
 
 def test_parse_strips_code_fences() -> None:

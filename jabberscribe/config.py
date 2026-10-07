@@ -62,6 +62,8 @@ class SttConfig(_Strict):
 class SummaryConfig(_Strict):
     #: The model_name LiteLLM serves for Gemma.
     model: str
+    #: Longer transcripts are summarized in chunks of about this many characters, then merged.
+    max_chunk_chars: int = 12000
 
 
 class RetentionConfig(_Strict):
