@@ -111,3 +111,26 @@ def make_sidecar() -> Callable[..., Path]:
         return path
 
     return _make
+
+
+@pytest.fixture
+def cfg_file(tmp_path: Path) -> Path:
+    """The `cfg` fixture's configuration as a YAML file, for tests that drive cli.main."""
+    path = tmp_path / "cfg.yaml"
+    path.write_text(
+        "paths:\n"
+        f"  drop_root: {(tmp_path / 'drop').as_posix()}\n"
+        f"  work_dir: {(tmp_path / 'work').as_posix()}\n"
+        f"  out_root: {(tmp_path / 'out').as_posix()}\n"
+        f"  db_path: {(tmp_path / 'js.db').as_posix()}\n"
+        "watcher:\n"
+        "  min_age_seconds: 0\n"
+        "litellm:\n"
+        "  base_url: http://litellm.test\n"
+        "stt:\n"
+        "  model: whisper-he\n"
+        "summary:\n"
+        "  model: gemma-3\n",
+        encoding="utf-8",
+    )
+    return path

@@ -25,6 +25,8 @@ PURGED_STT_AUDIO = "purged_stt_audio"
 PURGED_QUARANTINE = "purged_quarantine"
 PURGED_ORPHAN = "purged_orphan"
 SCRUBBED_METADATA = "scrubbed_metadata"
+LEGAL_HOLD_SET = "legal_hold_set"
+LEGAL_HOLD_RELEASED = "legal_hold_released"
 PURGE_FAILED_JOB = "purge_failed_job"
 
 _SCHEMA = """

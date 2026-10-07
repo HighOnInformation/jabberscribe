@@ -36,8 +36,17 @@ STAGE_ORDER: tuple[str, ...] = ("audio", "stt", "summarize", "output")
 #: The checkpoint of a job that failed in the audio or STT stage: a failure of that copy's recording.
 COPY_STAGES: tuple[str, ...] = (QUEUED, "audio")
 
-#: Stored in PRAGMA user_version. A database written by any other version is refused.
-SCHEMA_VERSION = 2
+#: Stored in PRAGMA user_version. Versions listed in MIGRATIONS are upgraded in place; any other is refused.
+SCHEMA_VERSION = 3
+
+#: Columns that upgrade a database from the keyed version to the next one: (name, type and default).
+#: A column that is already there is skipped, so a pre-release database that has it upgrades cleanly.
+MIGRATIONS: dict[int, tuple[tuple[str, str], ...]] = {
+    2: (
+        ("legal_hold", "INTEGER NOT NULL DEFAULT 0"),
+        ("hold_reason", "TEXT"),
+    ),
+}
 
 #: What a scrubbed row keeps of its sidecar once the text retention has passed.
 SCRUBBED_SIDECAR = "{}"
@@ -59,6 +68,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   transient_failures INTEGER NOT NULL DEFAULT 0,
   last_error      TEXT,
   next_attempt_at TEXT,
+  legal_hold      INTEGER NOT NULL DEFAULT 0,
+  hold_reason     TEXT,
   created_at      TEXT NOT NULL,
   updated_at      TEXT NOT NULL
 );
@@ -110,6 +121,8 @@ class Job:
     created_at: str
     next_attempt_at: str | None
     transient_failures: int
+    legal_hold: bool = False
+    hold_reason: str | None = None
 
 
 def _row_to_job(row: sqlite3.Row) -> Job:
@@ -130,6 +143,8 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         created_at=row["created_at"],
         next_attempt_at=row["next_attempt_at"],
         transient_failures=row["transient_failures"],
+        legal_hold=bool(row["legal_hold"]),
+        hold_reason=row["hold_reason"],
     )
 
 
@@ -147,23 +162,41 @@ class JobStore:
         self._conn.close()
 
     def init_schema(self) -> None:
-        """Create the tables, or refuse a database written by another version.
+        """Create the tables, upgrade a known older database in place, or refuse anything else.
 
         CREATE TABLE IF NOT EXISTS would silently keep an older jobs table and
         fail later with a cryptic column error, so the version is checked first.
         """
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
         has_jobs = self._conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'").fetchone()
-        if has_jobs and version != SCHEMA_VERSION:
+        if has_jobs and version != SCHEMA_VERSION and version not in MIGRATIONS:
             raise SchemaError(
                 f"database schema version {version} is not {SCHEMA_VERSION}; point paths.db_path at a fresh file"
             )
+        if has_jobs:
+            while version != SCHEMA_VERSION:
+                self._migrate(version)
+                version += 1
         self._conn.executescript(_SCHEMA)
         # A v2 database created before transient_failures existed (pre-release only).
         columns = {r["name"] for r in self._conn.execute("PRAGMA table_info(jobs)")}
         if "transient_failures" not in columns:
             self._conn.execute("ALTER TABLE jobs ADD COLUMN transient_failures INTEGER NOT NULL DEFAULT 0")
         self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def _migrate(self, version: int) -> None:
+        """Upgrade from `version` to the next version in one transaction."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            present = {r["name"] for r in self._conn.execute("PRAGMA table_info(jobs)")}
+            for name, definition in MIGRATIONS[version]:
+                if name not in present:
+                    self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
+            self._conn.execute(f"PRAGMA user_version = {version + 1}")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        self._conn.execute("COMMIT")
 
     def create(
         self,
@@ -357,6 +390,40 @@ class JobStore:
             (SCRUBBED_SIDECAR, utcnow(), job_key, SCRUBBED_SIDECAR),
         )
         return cur.rowcount == 1
+
+    def hold(self, job_key: str, reason: str) -> bool:
+        """Put a job on legal hold, or replace the reason of its hold. Returns False for an unknown job."""
+        cur = self._conn.execute(
+            "UPDATE jobs SET legal_hold = 1, hold_reason = ?, updated_at = ? WHERE job_key = ?",
+            (reason, utcnow(), job_key),
+        )
+        return cur.rowcount == 1
+
+    def release_hold(self, job_key: str) -> bool:
+        """Lift a legal hold. Returns False unless the job was on hold."""
+        cur = self._conn.execute(
+            "UPDATE jobs SET legal_hold = 0, hold_reason = NULL, updated_at = ? WHERE job_key = ? AND legal_hold = 1",
+            (utcnow(), job_key),
+        )
+        return cur.rowcount == 1
+
+    def is_held(self, job_key: str) -> bool:
+        """True when this job, its primary, a fellow member, or one of its members is on hold.
+
+        A conference is one call: a hold on any copy of it holds every copy.
+        hand_over keeps groups one level deep, so these four relations cover a whole group.
+        """
+        row = self._conn.execute(
+            "SELECT 1 FROM jobs h, jobs k WHERE k.job_key = ? AND h.legal_hold = 1 AND ("
+            " h.job_key = k.job_key OR h.job_key = k.grouped_into OR h.grouped_into = k.job_key"
+            " OR (k.grouped_into IS NOT NULL AND h.grouped_into = k.grouped_into)) LIMIT 1",
+            (job_key,),
+        ).fetchone()
+        return row is not None
+
+    def held_jobs(self) -> list[Job]:
+        rows = self._conn.execute("SELECT * FROM jobs WHERE legal_hold = 1 ORDER BY created_at, rowid").fetchall()
+        return [_row_to_job(r) for r in rows]
 
     def list_all(self) -> list[Job]:
         rows = self._conn.execute("SELECT * FROM jobs ORDER BY created_at, rowid").fetchall()

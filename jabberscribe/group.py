@@ -146,9 +146,20 @@ def _discard_outputs(cfg: Config, audit: AuditLog, old: Job, new_key: str) -> bo
     return not errors
 
 
-def _discard_all(cfg: Config, audit: AuditLog, olds: list[Job], new_key: str) -> bool:
+def _discard_all(cfg: Config, store: JobStore, audit: AuditLog, olds: list[Job], new_key: str) -> bool:
+    """Discard the outputs of every superseded primary, except one on legal hold: its outputs are evidence.
+
+    The new primary writes its own folder, so a held loser's files stay where they are.
+    """
+    done: list[bool] = []
     # Try every job, even after one fails, so the retry has less left to do.
-    return all([_discard_outputs(cfg, audit, old, new_key) for old in olds])
+    for old in olds:
+        if store.is_held(old.job_key):
+            audit.record(old.job_key, SUPERSEDED, f"replaced by {new_key}; outputs kept under legal hold")
+            done.append(True)
+        else:
+            done.append(_discard_outputs(cfg, audit, old, new_key))
+    return all(done)
 
 
 def _promote(store: JobStore, new: Job, olds: list[Job], changes: _Changes) -> None:
@@ -229,7 +240,7 @@ def _merge(
     if winner is None:
         return None
     losers = [p for p in live if p.job_key != winner.job_key] + failed
-    if not _discard_all(cfg, audit, losers, winner.job_key):
+    if not _discard_all(cfg, store, audit, losers, winner.job_key):
         return None
     if winner in live:
         assert copy is not None  # without a copy there is no live primary to merge

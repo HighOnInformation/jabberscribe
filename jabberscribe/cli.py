@@ -27,7 +27,7 @@ from pathlib import Path
 
 import httpx
 
-from jabberscribe.audit import AuditLog
+from jabberscribe.audit import LEGAL_HOLD_RELEASED, LEGAL_HOLD_SET, AuditLog
 from jabberscribe.config import Config, ConfigError, load_config
 from jabberscribe.group import requeue_failed, settle
 from jabberscribe.jobs import DONE, FAILED, GROUPED, QUEUED, RUNNING, WAITING, JobStore, SchemaError
@@ -253,6 +253,7 @@ def _report_purge(cfg: Config, store: JobStore, audit: AuditLog) -> int:
     print(f"audio deleted: {len(result.audio_deleted)}")
     print(f"text deleted: {len(result.text_deleted)}")
     print(f"leftovers swept: {len(result.swept)}")
+    print(f"on legal hold (kept): {len(result.held)}")
     for problem in result.errors:
         print(f"  ! {problem}", file=sys.stderr)
     return 1 if result.errors else 0
@@ -311,6 +312,29 @@ def _retry(store: JobStore, job_key: str | None, all_failed: bool) -> int:
     return 1 if refused else 0
 
 
+def _hold(store: JobStore, audit: AuditLog, job_key: str, reason: str) -> int:
+    """Put a call on legal hold. The audit row's actor is the OS account running the command."""
+    reason = reason.strip()
+    if not reason:
+        print("a reason is required for a legal hold", file=sys.stderr)
+        return 1
+    if not store.hold(job_key, reason):
+        print(f"{job_key}: unknown job", file=sys.stderr)
+        return 1
+    audit.record(job_key, LEGAL_HOLD_SET, reason)
+    print(f"{job_key}: on legal hold; purge skips it and every copy of its conference")
+    return 0
+
+
+def _unhold(store: JobStore, audit: AuditLog, job_key: str, reason: str) -> int:
+    if not store.release_hold(job_key):
+        print(f"{job_key}: not on legal hold; nothing released", file=sys.stderr)
+        return 1
+    audit.record(job_key, LEGAL_HOLD_RELEASED, reason.strip())
+    print(f"{job_key}: legal hold released; retention applies again")
+    return 0
+
+
 def _status(store: JobStore) -> int:
     """Counts by status, the oldest waiting and queued job, and every retrying or failed job.
 
@@ -340,6 +364,9 @@ def _status(store: JobStore) -> int:
             note = f" (handed over to {job.grouped_into})" if job.grouped_into else ""
             print(f"  ! {job.job_key}: {job.last_error}{note}")
             unresolved = unresolved or primary is None or primary.status != DONE
+    for job in store.held_jobs():
+        # Information only: a hold never changes the exit code.
+        print(f"  h {job.job_key}: on legal hold: {job.hold_reason}")
     return 1 if unresolved else 0
 
 
@@ -363,7 +390,15 @@ def _build_parser() -> argparse.ArgumentParser:
     target.add_argument("job_key", nargs="?")
     target.add_argument("--failed", action="store_true", help="every failed job")
 
-    sub.add_parser("status", help="job counts, backlog age, retrying and failed jobs")
+    sub.add_parser("status", help="job counts, backlog age, retrying, failed and held jobs")
+
+    hold_cmd = sub.add_parser("hold", help="put a call on legal hold: purge keeps it until unhold")
+    hold_cmd.add_argument("job_key")
+    hold_cmd.add_argument("--reason", required=True, help="why, e.g. the case number (audited)")
+
+    unhold_cmd = sub.add_parser("unhold", help="release a legal hold; retention applies again")
+    unhold_cmd.add_argument("job_key")
+    unhold_cmd.add_argument("--reason", default="", help="why (audited)")
     return parser
 
 
@@ -398,6 +433,10 @@ def main(argv: list[str] | None = None) -> int:
         return _retry(store, args.job_key, args.failed)
     if args.command == "status":
         return _status(store)
+    if args.command == "hold":
+        return _hold(store, audit, args.job_key, args.reason)
+    if args.command == "unhold":
+        return _unhold(store, audit, args.job_key, args.reason)
 
     try:
         with instance_lock(cfg.paths.db_path):

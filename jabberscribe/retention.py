@@ -13,6 +13,9 @@ clock stuck in the past cannot get a fresh call deleted.
 Besides the job rows, the purge sweeps every other place a voice can linger:
 leftover STT copies in work/, quarantined pairs, and inbox orphans. Past the
 text retention a row keeps no call metadata. Every deletion is audited.
+
+A call on legal hold -- and every copy of its conference -- is skipped
+entirely until the hold is released (`jabberscribe unhold`).
 """
 
 from __future__ import annotations
@@ -55,6 +58,8 @@ class PurgeResult:
     #: Paths of swept files: STT leftovers, quarantined pairs, inbox orphans.
     swept: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
+    #: Calls past audio retention that were kept because of a legal hold.
+    held: tuple[str, ...] = ()
 
 
 def _age_days(job: Job, now: datetime) -> float | None:
@@ -129,6 +134,7 @@ def purge(cfg: Config, store: JobStore, audit: AuditLog, now: datetime) -> Purge
     audio_deleted: list[str] = []
     text_deleted: list[str] = []
     errors: list[str] = []
+    held: list[str] = []
     jobs = store.list_all()
     active_keys = {j.job_key for j in jobs if j.status in ACTIVE}
 
@@ -140,6 +146,12 @@ def purge(cfg: Config, store: JobStore, audit: AuditLog, now: datetime) -> Purge
         active = job.job_key in active_keys
 
         try:
+            if store.is_held(job.job_key):
+                # Checked per job, right before deleting, so a hold set during a purge still counts.
+                # An active held job is not failed for its audio either: the audio is kept.
+                if age > cfg.retention.audio_days:
+                    held.append(job.job_key)
+                continue
             if age > cfg.retention.audio_days and job.audio_path.is_file():
                 try:
                     job.audio_path.unlink()
@@ -180,12 +192,13 @@ def purge(cfg: Config, store: JobStore, audit: AuditLog, now: datetime) -> Purge
         errors += sweep_errors
 
     log.info(
-        "purge deleted %d audio file(s), text for %d call(s), %d leftover file(s)",
+        "purge deleted %d audio file(s), text for %d call(s), %d leftover file(s); %d call(s) kept on legal hold",
         len(audio_deleted),
         len(text_deleted),
         len(swept),
+        len(held),
     )
-    return PurgeResult(tuple(audio_deleted), tuple(text_deleted), tuple(swept), tuple(errors))
+    return PurgeResult(tuple(audio_deleted), tuple(text_deleted), tuple(swept), tuple(errors), tuple(held))
 
 
 def _stem(path: Path) -> str:
