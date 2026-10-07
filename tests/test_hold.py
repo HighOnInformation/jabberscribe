@@ -5,7 +5,7 @@ from pathlib import Path
 
 from jabberscribe.audit import LEGAL_HOLD_RELEASED, LEGAL_HOLD_SET, PURGED_AUDIO, SUPERSEDED, UNHOLD_FAILED, AuditLog
 from jabberscribe.cli import main
-from jabberscribe.group import settle
+from jabberscribe.group import _discard_all, settle
 from jabberscribe.jobs import DONE, SCRUBBED_SIDECAR, JobStore
 from jabberscribe.output import RESULT_FILE, TEXT_FILES, TRANSCRIPT_FILE
 from jabberscribe.retention import purge
@@ -256,3 +256,62 @@ def test_unhold_says_when_other_copies_remain_held(cfg_file, store, capsys) -> N
     out = capsys.readouterr().out
     assert "n_3: legal hold released" in out
     assert "still held by p_1" in out
+
+
+def test_a_held_losers_superseded_row_is_written_once_across_retries(cfg, store, audit) -> None:
+    _job(store, "p_1", conference_id="conf-1")
+    store.hold("p_1", "litigation")
+    loser = store.get("p_1")
+
+    for _ in range(2):
+        assert _discard_all(cfg, store, audit, [loser], "w_2") is True
+
+    assert [e.action for e in audit.entries("p_1")].count(SUPERSEDED) == 1
+
+
+def test_purge_keeps_every_copy_when_the_hold_is_on_a_member(cfg, store, audit, make_wav, make_sidecar) -> None:
+    start = "2026-10-07T14:00:00+03:00"
+    primary = _drop(cfg, store, audit, make_wav, make_sidecar, "a", "1042", started_at=start, duration_sec=480)
+    member = _drop(cfg, store, audit, make_wav, make_sidecar, "b", "2210", started_at=start, duration_sec=60)
+    for key in (primary, member):
+        _set_created(cfg, key, STARTED)
+    settle(cfg, store, audit, datetime.now(UTC))
+    assert store.get(member).grouped_into == primary
+    store.set_status(primary, DONE)
+    out_dir = store.get(primary).out_dir
+    for name in TEXT_FILES:
+        (out_dir / name).write_text("x", encoding="utf-8")
+    store.hold(member, "litigation")
+
+    result = purge(cfg, store, audit, now=STARTED + timedelta(days=400))
+
+    assert sorted(result.held) == sorted([primary, member])
+    assert (result.audio_deleted, result.text_deleted) == ((), ())
+    assert store.get(primary).audio_path.is_file() and store.get(member).audio_path.is_file()
+    assert (out_dir / RESULT_FILE).is_file()
+
+
+def test_a_primary_keeps_its_outputs_when_superseded_while_a_member_is_held(
+    cfg, store, audit, make_wav, make_sidecar
+) -> None:
+    start = "2026-10-07T14:00:00+03:00"
+    leaver = _drop(cfg, store, audit, make_wav, make_sidecar, "a", "1042", started_at=start, duration_sec=480)
+    member = _drop(cfg, store, audit, make_wav, make_sidecar, "c", "3300", started_at=start, duration_sec=60)
+    for key in (leaver, member):
+        _set_created(cfg, key, datetime.now(UTC) - timedelta(seconds=61))
+    settle(cfg, store, audit, datetime.now(UTC))
+    assert store.get(member).grouped_into == leaver
+    out_dir = store.get(leaver).out_dir
+    (out_dir / RESULT_FILE).write_text(json.dumps({"owners": []}), encoding="utf-8")
+    (out_dir / TRANSCRIPT_FILE).write_text("x", encoding="utf-8")
+    store.set_status(leaver, DONE)
+    store.hold(member, "litigation")
+
+    host = _drop(cfg, store, audit, make_wav, make_sidecar, "b", "2210", started_at=start, duration_sec=3600)
+    result = settle(cfg, store, audit, datetime.now(UTC))
+
+    assert result.superseded == (leaver,)
+    assert result.released == (host,)
+    assert (out_dir / RESULT_FILE).is_file()
+    assert (out_dir / TRANSCRIPT_FILE).is_file()
+    assert "legal hold" in audit.entries(leaver)[-1].detail

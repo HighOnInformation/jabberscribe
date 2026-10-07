@@ -149,13 +149,16 @@ def _discard_outputs(cfg: Config, audit: AuditLog, old: Job, new_key: str) -> bo
 def _discard_all(cfg: Config, store: JobStore, audit: AuditLog, olds: list[Job], new_key: str) -> bool:
     """Discard the outputs of every superseded primary, except one on legal hold: its outputs are evidence.
 
-    The new primary writes its own folder, so a held loser's files stay where they are.
+    The new primary writes its own folder, so a held loser's files stay where they are. Its audit row
+    is written once, not again on each poll that retries a locked file of another loser.
     """
     done: list[bool] = []
     # Try every job, even after one fails, so the retry has less left to do.
     for old in olds:
         if store.is_held(old.job_key):
-            audit.record(old.job_key, SUPERSEDED, f"replaced by {new_key}; outputs kept under legal hold")
+            detail = f"replaced by {new_key}; outputs kept under legal hold"
+            if not any(e.action == SUPERSEDED and e.detail == detail for e in audit.entries(old.job_key)):
+                audit.record(old.job_key, SUPERSEDED, detail)
             done.append(True)
         else:
             done.append(_discard_outputs(cfg, audit, old, new_key))
