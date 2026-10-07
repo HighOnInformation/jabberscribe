@@ -146,16 +146,17 @@ def _discard_outputs(cfg: Config, audit: AuditLog, old: Job, new_key: str) -> bo
     return not errors
 
 
-def _discard_all(cfg: Config, store: JobStore, audit: AuditLog, olds: list[Job], new_key: str) -> bool:
-    """Discard the outputs of every superseded primary, except one on legal hold: its outputs are evidence.
+def _discard_all(cfg: Config, audit: AuditLog, olds: list[Job], new_key: str, *, held: bool) -> bool:
+    """Discard the outputs of every superseded primary, unless the call is on legal hold: its outputs are evidence.
 
+    `held` covers the whole merge: a hold on any copy of the conference keeps every loser's outputs.
     The new primary writes its own folder, so a held loser's files stay where they are. Its audit row
     is written once, not again on each poll that retries a locked file of another loser.
     """
     done: list[bool] = []
     # Try every job, even after one fails, so the retry has less left to do.
     for old in olds:
-        if store.is_held(old.job_key):
+        if held:
             detail = f"replaced by {new_key}; outputs kept under legal hold"
             if not any(e.action == SUPERSEDED and e.detail == detail for e in audit.entries(old.job_key)):
                 audit.record(old.job_key, SUPERSEDED, detail)
@@ -243,7 +244,11 @@ def _merge(
     if winner is None:
         return None
     losers = [p for p in live if p.job_key != winner.job_key] + failed
-    if not _discard_all(cfg, store, audit, losers, winner.job_key):
+    # A hold on any copy holds the call. The links between these jobs do not exist yet (the copy is still
+    # WAITING, bridged primaries are separate groups), so ask each one; is_held also covers its members.
+    merged = [winner, *([copy] if copy is not None else []), *losers]
+    held = any(store.is_held(j.job_key) for j in merged)
+    if not _discard_all(cfg, audit, losers, winner.job_key, held=held):
         return None
     if winner in live:
         assert copy is not None  # without a copy there is no live primary to merge

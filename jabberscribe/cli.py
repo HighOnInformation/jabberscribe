@@ -29,7 +29,7 @@ from pathlib import Path
 import httpx
 
 from jabberscribe.alerts import LITELLM_DOWN, PURGE_ERRORS, Alerter, check_jobs, make_alerter, probe_litellm
-from jabberscribe.audit import LEGAL_HOLD_RELEASED, LEGAL_HOLD_SET, UNHOLD_FAILED, AuditLog
+from jabberscribe.audit import HOLD_FAILED, LEGAL_HOLD_RELEASED, LEGAL_HOLD_SET, UNHOLD_FAILED, AuditLog
 from jabberscribe.config import Config, ConfigError, load_config
 from jabberscribe.cues import Tagger, load_tagger, unavailable_reason
 from jabberscribe.group import requeue_failed, settle
@@ -371,10 +371,27 @@ def _hold(store: JobStore, audit: AuditLog, job_key: str, reason: str) -> int:
     if not reason:
         print("a reason is required for a legal hold", file=sys.stderr)
         return 1
-    if not store.hold(job_key, reason):
+    if store.get(job_key) is None:
         print(f"{job_key}: unknown job", file=sys.stderr)
         return 1
-    audit.record(job_key, LEGAL_HOLD_SET, reason)
+    # The audit row comes first: a hold is never placed unaudited.
+    try:
+        audit.record(job_key, LEGAL_HOLD_SET, reason)
+    except sqlite3.Error as exc:
+        print(f"{job_key}: cannot write the audit row; no hold placed: {exc}", file=sys.stderr)
+        return 1
+    try:
+        placed = store.hold(job_key, reason)
+        error = "" if placed else "the job is gone"
+    except sqlite3.Error as exc:
+        placed, error = False, str(exc)
+    if not placed:
+        print(f"{job_key}: legal hold not placed: {error}", file=sys.stderr)
+        try:
+            audit.record(job_key, HOLD_FAILED, error)
+        except sqlite3.Error as exc:
+            print(f"{job_key}: cannot audit the failed hold: {exc}", file=sys.stderr)
+        return 1
     print(f"{job_key}: on legal hold; purge skips it and every copy of its conference")
     return 0
 

@@ -29,6 +29,8 @@ LEGAL_HOLD_SET = "legal_hold_set"
 LEGAL_HOLD_RELEASED = "legal_hold_released"
 #: Follows a LEGAL_HOLD_RELEASED row whose release then did not happen: the hold is still in place.
 UNHOLD_FAILED = "unhold_failed"
+#: Follows a LEGAL_HOLD_SET row whose hold then could not be placed: the call is not held.
+HOLD_FAILED = "hold_failed"
 PURGE_FAILED_JOB = "purge_failed_job"
 
 _SCHEMA = """

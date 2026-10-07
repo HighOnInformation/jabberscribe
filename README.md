@@ -121,8 +121,8 @@ windows.
 — and every copy of its conference — from purge until `jabberscribe unhold`.
 A held conference's earlier output is also kept when a longer copy replaces
 it. Every hold and release is audited with the OS account that ran it (the
-audit row is written before the release; a release that then fails is audited
-as `unhold_failed`); `status` lists the held calls, and `unhold` on a copy that
+audit row is written before the hold or release; one that then fails is audited
+as `hold_failed` or `unhold_failed`); `status` lists the held calls, and `unhold` on a copy that
 is not itself held names the copy that holds the call.
 
 ## Monitoring

@@ -3,7 +3,15 @@ import sqlite3
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
-from jabberscribe.audit import LEGAL_HOLD_RELEASED, LEGAL_HOLD_SET, PURGED_AUDIO, SUPERSEDED, UNHOLD_FAILED, AuditLog
+from jabberscribe.audit import (
+    HOLD_FAILED,
+    LEGAL_HOLD_RELEASED,
+    LEGAL_HOLD_SET,
+    PURGED_AUDIO,
+    SUPERSEDED,
+    UNHOLD_FAILED,
+    AuditLog,
+)
 from jabberscribe.cli import main
 from jabberscribe.group import _discard_all, settle
 from jabberscribe.jobs import DONE, SCRUBBED_SIDECAR, JobStore
@@ -260,11 +268,10 @@ def test_unhold_says_when_other_copies_remain_held(cfg_file, store, capsys) -> N
 
 def test_a_held_losers_superseded_row_is_written_once_across_retries(cfg, store, audit) -> None:
     _job(store, "p_1", conference_id="conf-1")
-    store.hold("p_1", "litigation")
     loser = store.get("p_1")
 
     for _ in range(2):
-        assert _discard_all(cfg, store, audit, [loser], "w_2") is True
+        assert _discard_all(cfg, audit, [loser], "w_2", held=True) is True
 
     assert [e.action for e in audit.entries("p_1")].count(SUPERSEDED) == 1
 
@@ -315,3 +322,86 @@ def test_a_primary_keeps_its_outputs_when_superseded_while_a_member_is_held(
     assert (out_dir / RESULT_FILE).is_file()
     assert (out_dir / TRANSCRIPT_FILE).is_file()
     assert "legal hold" in audit.entries(leaver)[-1].detail
+
+
+def test_a_hold_on_the_arriving_copy_keeps_the_superseded_primarys_outputs(
+    cfg, store, audit, make_wav, make_sidecar
+) -> None:
+    """Reviewer probe: the longer copy is held while still WAITING, before it is grouped with anything."""
+    start = "2026-10-07T14:00:00+03:00"
+    leaver = _drop(cfg, store, audit, make_wav, make_sidecar, "a", "1042", started_at=start, duration_sec=480)
+    _set_created(cfg, leaver, datetime.now(UTC) - timedelta(seconds=61))
+    settle(cfg, store, audit, datetime.now(UTC))
+    out_dir = store.get(leaver).out_dir
+    (out_dir / RESULT_FILE).write_text(json.dumps({"owners": []}), encoding="utf-8")
+    (out_dir / TRANSCRIPT_FILE).write_text("x", encoding="utf-8")
+    store.set_status(leaver, DONE)
+    host = _drop(cfg, store, audit, make_wav, make_sidecar, "b", "2210", started_at=start, duration_sec=3600)
+    store.hold(host, "litigation")
+
+    result = settle(cfg, store, audit, datetime.now(UTC))
+
+    assert result.superseded == (leaver,)
+    assert result.released == (host,)
+    assert (out_dir / RESULT_FILE).is_file()
+    assert (out_dir / TRANSCRIPT_FILE).is_file()
+    assert "legal hold" in audit.entries(leaver)[-1].detail
+
+
+def test_a_hold_on_one_bridged_primary_keeps_every_losers_outputs(cfg, store, audit, make_wav, make_sidecar) -> None:
+    """Two primaries released separately; the host's copy bridges them. Only the joiner is held."""
+    leaver = _drop(
+        cfg, store, audit, make_wav, make_sidecar, "a", "1042", started_at="2026-10-07T14:00:00+03:00", duration_sec=480
+    )
+    _set_created(cfg, leaver, datetime.now(UTC) - timedelta(seconds=61))
+    settle(cfg, store, audit, datetime.now(UTC))
+    joiner = _drop(
+        cfg, store, audit, make_wav, make_sidecar, "j", "4000", started_at="2026-10-07T14:30:00+03:00", duration_sec=600
+    )
+    _set_created(cfg, joiner, datetime.now(UTC) - timedelta(seconds=61))
+    assert settle(cfg, store, audit, datetime.now(UTC)).released == (joiner,)
+    for key in (leaver, joiner):
+        out_dir = store.get(key).out_dir
+        (out_dir / RESULT_FILE).write_text(json.dumps({"owners": []}), encoding="utf-8")
+        (out_dir / TRANSCRIPT_FILE).write_text("x", encoding="utf-8")
+        store.set_status(key, DONE)
+    store.hold(joiner, "litigation")
+
+    start = "2026-10-07T14:00:00+03:00"
+    host = _drop(cfg, store, audit, make_wav, make_sidecar, "b", "2210", started_at=start, duration_sec=3600)
+    result = settle(cfg, store, audit, datetime.now(UTC))
+
+    assert result.released == (host,)
+    assert sorted(result.superseded) == sorted([leaver, joiner])
+    for key in (leaver, joiner):
+        out_dir = store.get(key).out_dir
+        assert (out_dir / RESULT_FILE).is_file()
+        assert (out_dir / TRANSCRIPT_FILE).is_file()
+        assert [e.action for e in audit.entries(key)].count(SUPERSEDED) == 1
+        assert "legal hold" in audit.entries(key)[-1].detail
+
+
+def test_hold_is_audited_before_it_is_placed(cfg_file, store, tmp_path, monkeypatch, capsys) -> None:
+    _job(store, "a_1")
+    _failing_record(monkeypatch, LEGAL_HOLD_SET)
+
+    assert main(["--config", str(cfg_file), "hold", "a_1", "--reason", "litigation"]) == 1
+
+    assert store.get("a_1").legal_hold is False
+    assert "cannot write the audit row" in capsys.readouterr().err
+
+
+def test_hold_audits_a_placement_that_failed(cfg_file, store, tmp_path, monkeypatch, capsys) -> None:
+    _job(store, "a_1")
+
+    def broken_hold(self, job_key: str, reason: str) -> bool:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(JobStore, "hold", broken_hold)
+
+    assert main(["--config", str(cfg_file), "hold", "a_1", "--reason", "litigation"]) == 1
+
+    assert store.get("a_1").legal_hold is False
+    actions = [e.action for e in AuditLog(tmp_path / "js.db").entries("a_1")]
+    assert actions[-2:] == [LEGAL_HOLD_SET, HOLD_FAILED]
+    assert "database is locked" in capsys.readouterr().err
