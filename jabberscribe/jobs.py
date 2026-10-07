@@ -422,15 +422,21 @@ class JobStore:
         """True when this job, its primary, a fellow member, or one of its members is on hold.
 
         A conference is one call: a hold on any copy of it holds every copy.
+        """
+        return bool(self.holders(job_key))
+
+    def holders(self, job_key: str) -> list[str]:
+        """The keys of the copies whose hold covers this job (see is_held), this job included when it is held.
+
         hand_over keeps groups one level deep, so these four relations cover a whole group.
         """
-        row = self._conn.execute(
-            "SELECT 1 FROM jobs h, jobs k WHERE k.job_key = ? AND h.legal_hold = 1 AND ("
+        rows = self._conn.execute(
+            "SELECT h.job_key FROM jobs h, jobs k WHERE k.job_key = ? AND h.legal_hold = 1 AND ("
             " h.job_key = k.job_key OR h.job_key = k.grouped_into OR h.grouped_into = k.job_key"
-            " OR (k.grouped_into IS NOT NULL AND h.grouped_into = k.grouped_into)) LIMIT 1",
+            " OR (k.grouped_into IS NOT NULL AND h.grouped_into = k.grouped_into)) ORDER BY h.created_at, h.rowid",
             (job_key,),
-        ).fetchone()
-        return row is not None
+        ).fetchall()
+        return [r["job_key"] for r in rows]
 
     def held_jobs(self) -> list[Job]:
         rows = self._conn.execute("SELECT * FROM jobs WHERE legal_hold = 1 ORDER BY created_at, rowid").fetchall()

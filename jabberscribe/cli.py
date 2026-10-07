@@ -16,6 +16,7 @@ import argparse
 import json
 import logging
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -28,7 +29,7 @@ from pathlib import Path
 import httpx
 
 from jabberscribe.alerts import LITELLM_DOWN, PURGE_ERRORS, Alerter, check_jobs, make_alerter, probe_litellm
-from jabberscribe.audit import LEGAL_HOLD_RELEASED, LEGAL_HOLD_SET, AuditLog
+from jabberscribe.audit import LEGAL_HOLD_RELEASED, LEGAL_HOLD_SET, UNHOLD_FAILED, AuditLog
 from jabberscribe.config import Config, ConfigError, load_config
 from jabberscribe.cues import Tagger, load_tagger, unavailable_reason
 from jabberscribe.group import requeue_failed, settle
@@ -373,11 +374,40 @@ def _hold(store: JobStore, audit: AuditLog, job_key: str, reason: str) -> int:
 
 
 def _unhold(store: JobStore, audit: AuditLog, job_key: str, reason: str) -> int:
-    if not store.release_hold(job_key):
-        print(f"{job_key}: not on legal hold; nothing released", file=sys.stderr)
+    """Release a legal hold. The audit row is written first: a hold is never released unaudited."""
+    job = store.get(job_key)
+    if job is None or not job.legal_hold:
+        holders = store.holders(job_key) if job is not None else []
+        if holders:
+            print(
+                f"{job_key}: not on legal hold itself; the call is held by {', '.join(holders)}; unhold that copy",
+                file=sys.stderr,
+            )
+        else:
+            print(f"{job_key}: not on legal hold; nothing released", file=sys.stderr)
         return 1
-    audit.record(job_key, LEGAL_HOLD_RELEASED, reason.strip())
-    print(f"{job_key}: legal hold released; retention applies again")
+    try:
+        audit.record(job_key, LEGAL_HOLD_RELEASED, reason.strip())
+    except sqlite3.Error as exc:
+        print(f"{job_key}: cannot write the audit row; hold kept: {exc}", file=sys.stderr)
+        return 1
+    try:
+        released = store.release_hold(job_key)
+        error = "" if released else "the hold was already released"
+    except sqlite3.Error as exc:
+        released, error = False, str(exc)
+    if not released:
+        print(f"{job_key}: legal hold not released: {error}", file=sys.stderr)
+        try:
+            audit.record(job_key, UNHOLD_FAILED, error)
+        except sqlite3.Error as exc:
+            print(f"{job_key}: cannot audit the failed release: {exc}", file=sys.stderr)
+        return 1
+    others = store.holders(job_key)
+    if others:
+        print(f"{job_key}: legal hold released; the call is still held by {', '.join(others)}; purge still skips it")
+    else:
+        print(f"{job_key}: legal hold released; retention applies again")
     return 0
 
 

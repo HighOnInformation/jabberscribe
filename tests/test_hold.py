@@ -3,10 +3,10 @@ import sqlite3
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
-from jabberscribe.audit import LEGAL_HOLD_RELEASED, LEGAL_HOLD_SET, PURGED_AUDIO, SUPERSEDED, AuditLog
+from jabberscribe.audit import LEGAL_HOLD_RELEASED, LEGAL_HOLD_SET, PURGED_AUDIO, SUPERSEDED, UNHOLD_FAILED, AuditLog
 from jabberscribe.cli import main
 from jabberscribe.group import settle
-from jabberscribe.jobs import DONE, SCRUBBED_SIDECAR
+from jabberscribe.jobs import DONE, SCRUBBED_SIDECAR, JobStore
 from jabberscribe.output import RESULT_FILE, TEXT_FILES, TRANSCRIPT_FILE
 from jabberscribe.retention import purge
 from jabberscribe.watcher import scan_once
@@ -186,3 +186,73 @@ def test_status_lists_held_calls(cfg_file, store, capsys) -> None:
     assert main(["--config", str(cfg_file), "status"]) == 0
 
     assert "h a_1: on legal hold: litigation" in capsys.readouterr().out
+
+
+def _failing_record(monkeypatch, failing_action: str) -> None:
+    real = AuditLog.record
+
+    def record(self, job_key: str, action: str, detail: str = "") -> None:
+        if action == failing_action:
+            raise sqlite3.OperationalError("disk I/O error")
+        real(self, job_key, action, detail)
+
+    monkeypatch.setattr(AuditLog, "record", record)
+
+
+def test_unhold_keeps_the_hold_when_the_audit_row_cannot_be_written(cfg_file, store, monkeypatch, capsys) -> None:
+    _job(store, "a_1")
+    store.hold("a_1", "litigation")
+    _failing_record(monkeypatch, LEGAL_HOLD_RELEASED)
+
+    assert main(["--config", str(cfg_file), "unhold", "a_1", "--reason", "case closed"]) == 1
+
+    assert store.get("a_1").legal_hold is True
+    assert "hold kept" in capsys.readouterr().err
+
+
+def test_unhold_audits_a_release_that_failed(cfg_file, store, tmp_path, monkeypatch, capsys) -> None:
+    _job(store, "a_1")
+    store.hold("a_1", "litigation")
+
+    def broken_release(self, job_key: str) -> bool:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(JobStore, "release_hold", broken_release)
+
+    assert main(["--config", str(cfg_file), "unhold", "a_1", "--reason", "case closed"]) == 1
+
+    assert store.get("a_1").legal_hold is True
+    actions = [e.action for e in AuditLog(tmp_path / "js.db").entries("a_1")]
+    assert actions[-2:] == [LEGAL_HOLD_RELEASED, UNHOLD_FAILED]
+    assert "database is locked" in capsys.readouterr().err
+
+
+def _conference(store) -> None:
+    for key in ("p_1", "m_2", "n_3"):
+        _job(store, key, conference_id="conf-1")
+    store.group_into("m_2", "p_1")
+    store.group_into("n_3", "p_1")
+
+
+def test_unhold_names_the_copy_that_holds_the_call(cfg_file, store, capsys) -> None:
+    _conference(store)
+    store.hold("p_1", "litigation")
+
+    assert main(["--config", str(cfg_file), "unhold", "m_2"]) == 1
+
+    err = capsys.readouterr().err
+    assert "m_2: not on legal hold itself" in err
+    assert "p_1" in err
+    assert store.get("p_1").legal_hold is True
+
+
+def test_unhold_says_when_other_copies_remain_held(cfg_file, store, capsys) -> None:
+    _conference(store)
+    store.hold("p_1", "litigation")
+    store.hold("n_3", "litigation")
+
+    assert main(["--config", str(cfg_file), "unhold", "n_3", "--reason", "x"]) == 0
+
+    out = capsys.readouterr().out
+    assert "n_3: legal hold released" in out
+    assert "still held by p_1" in out
