@@ -24,10 +24,13 @@ def cfg(tmp_path: Path) -> Config:
         paths={
             "drop_root": tmp_path / "drop",
             "work_dir": tmp_path / "work",
-            "audio_store": tmp_path / "audio",
+            "out_root": tmp_path / "out",
             "db_path": tmp_path / "js.db",
         },
         watcher={"min_age_seconds": 0},
+        litellm={"base_url": "http://litellm.test"},
+        stt={"model": "whisper-he"},
+        summary={"model": "gemma-3"},
     )
     config.paths.inbox.mkdir(parents=True)
     config.paths.quarantine.mkdir(parents=True)

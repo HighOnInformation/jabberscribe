@@ -12,11 +12,12 @@ import logging
 import shutil
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from jabberscribe.config import Config
 from jabberscribe.jobs import JobStore
-from jabberscribe.sidecar import SidecarError, parse_sidecar
+from jabberscribe.sidecar import Sidecar, SidecarError, parse_sidecar
 
 log = logging.getLogger(__name__)
 
@@ -76,13 +77,18 @@ def quarantine_pair(paths: list[Path], quarantine_dir: Path, reason: str) -> Non
     log.warning("quarantined %s: %s", stem, reason)
 
 
+def out_dir_for(out_root: Path, sidecar: Sidecar) -> Path:
+    """out_root/<YYYY>/<MM>/<job_key>, dated by when the call started."""
+    started = datetime.fromisoformat(sidecar.started_at)
+    return out_root / f"{started:%Y}" / f"{started:%m}" / sidecar.job_key
+
+
 def scan_once(cfg: Config, store: JobStore, min_age_seconds: int | None = None) -> ScanResult:
     """Process every ready pair in the inbox exactly once.
 
     `min_age_seconds` overrides the configured settling delay. The `process`
     command passes 0: a human handing us one file is not a race with a recorder.
     """
-    cfg.paths.audio_store.mkdir(parents=True, exist_ok=True)
     min_age = cfg.watcher.min_age_seconds if min_age_seconds is None else min_age_seconds
     enqueued: list[str] = []
     quarantined: list[str] = []
@@ -97,26 +103,30 @@ def scan_once(cfg: Config, store: JobStore, min_age_seconds: int | None = None) 
             quarantined.append(sidecar_path.stem)
             continue
 
-        stored_audio = cfg.paths.audio_store / f"{sidecar.call_id}{audio.suffix}"
+        out_dir = out_dir_for(cfg.paths.out_root, sidecar)
+        stored_audio = out_dir / f"recording{audio.suffix}"
         created = store.create(
+            job_key=sidecar.job_key,
             call_id=sidecar.call_id,
+            conference_id=sidecar.conference_id,
             audio_path=stored_audio,
+            out_dir=out_dir,
             sidecar_json=sidecar.raw,
-            kind=sidecar.kind,
             started_at=sidecar.started_at,
             duration_sec=sidecar.duration_sec,
         )
         if not created:
             # Already known. Drop the duplicate rather than reprocess it.
-            log.info("duplicate call_id %s, discarding inbox copy", sidecar.call_id)
+            log.info("duplicate %s, discarding inbox copy", sidecar.job_key)
             audio.unlink(missing_ok=True)
             sidecar_path.unlink(missing_ok=True)
-            skipped.append(sidecar.call_id)
+            skipped.append(sidecar.job_key)
             continue
 
+        out_dir.mkdir(parents=True, exist_ok=True)
         shutil.move(str(audio), str(stored_audio))
         sidecar_path.unlink(missing_ok=True)
-        enqueued.append(sidecar.call_id)
-        log.info("enqueued %s", sidecar.call_id)
+        enqueued.append(sidecar.job_key)
+        log.info("enqueued %s", sidecar.job_key)
 
     return ScanResult(tuple(enqueued), tuple(quarantined), tuple(skipped))

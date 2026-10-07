@@ -1,157 +1,83 @@
+import copy
 from pathlib import Path
 
 import pytest
+import yaml
 
 from jabberscribe.config import ConfigError, load_config
 
-MINIMAL_YAML = """
-paths:
-  drop_root: D:/js/drop
-  work_dir: D:/js/work
-  audio_store: D:/js/audio
-  db_path: D:/js/jabberscribe.db
-"""
+BASE: dict = {
+    "paths": {
+        "drop_root": "D:/js/drop",
+        "work_dir": "D:/js/work",
+        "out_root": "D:/js/out",
+        "db_path": "D:/js/js.db",
+    },
+    "litellm": {"base_url": "http://litellm.corp.local:4000"},
+    "stt": {"model": "whisper-he"},
+    "summary": {"model": "gemma-3"},
+}
 
 
-def test_load_config_applies_defaults(tmp_path: Path) -> None:
-    cfg_file = tmp_path / "cfg.yaml"
-    cfg_file.write_text(MINIMAL_YAML, encoding="utf-8")
+def _write(tmp_path: Path, data: object) -> Path:
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
+    return path
 
-    cfg = load_config(cfg_file)
 
-    assert cfg.paths.drop_root == Path("D:/js/drop")
+def test_minimal_config_loads_with_defaults(tmp_path: Path) -> None:
+    cfg = load_config(_write(tmp_path, BASE))
+
     assert cfg.paths.inbox == Path("D:/js/drop/inbox")
     assert cfg.paths.quarantine == Path("D:/js/drop/quarantine")
-    assert cfg.watcher.poll_seconds == 30
+    assert cfg.paths.out_root == Path("D:/js/out")
     assert cfg.watcher.min_age_seconds == 15
-    assert cfg.stt.model == "ivrit-ai/whisper-large-v3-turbo-ct2"
-    assert cfg.stt.compute_type == "int8"
-    assert cfg.stt.device == "auto"
+    assert (cfg.group.settle_seconds, cfg.group.max_wait_seconds) == (60, 300)
+    assert cfg.litellm.timeout_seconds == 600
+    assert cfg.stt.model == "whisper-he"
+    assert cfg.stt.vocabulary_file is None
+    assert cfg.summary.model == "gemma-3"
+    assert (cfg.retention.audio_days, cfg.retention.text_days) == (90, 365)
 
 
-def test_load_config_overrides_defaults(tmp_path: Path) -> None:
-    cfg_file = tmp_path / "cfg.yaml"
-    cfg_file.write_text(
-        MINIMAL_YAML + "\nwatcher:\n  min_age_seconds: 5\nstt:\n  device: cuda\n",
-        encoding="utf-8",
-    )
+@pytest.mark.parametrize("section", ["litellm", "stt", "summary"])
+def test_required_sections(tmp_path: Path, section: str) -> None:
+    data = copy.deepcopy(BASE)
+    del data[section]
 
-    cfg = load_config(cfg_file)
-
-    assert cfg.watcher.min_age_seconds == 5
-    assert cfg.stt.device == "cuda"
+    with pytest.raises(ConfigError, match=section):
+        load_config(_write(tmp_path, data))
 
 
-def test_load_config_rejects_missing_paths_section(tmp_path: Path) -> None:
-    cfg_file = tmp_path / "cfg.yaml"
-    cfg_file.write_text("watcher:\n  poll_seconds: 10\n", encoding="utf-8")
+def test_unknown_key_is_rejected(tmp_path: Path) -> None:
+    data = copy.deepcopy(BASE)
+    data["paths"]["audio_store"] = "D:/js/audio"
 
-    with pytest.raises(ConfigError, match="paths"):
-        load_config(cfg_file)
-
-
-def test_load_config_rejects_unknown_device(tmp_path: Path) -> None:
-    cfg_file = tmp_path / "cfg.yaml"
-    cfg_file.write_text(MINIMAL_YAML + "\nstt:\n  device: tpu\n", encoding="utf-8")
-
-    with pytest.raises(ConfigError, match="device"):
-        load_config(cfg_file)
+    with pytest.raises(ConfigError, match="audio_store"):
+        load_config(_write(tmp_path, data))
 
 
-def test_load_config_missing_file(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="not found"):
-        load_config(tmp_path / "nope.yaml")
-
-
-def _write(tmp_path: Path, extra: str) -> Path:
-    cfg_file = tmp_path / "cfg.yaml"
-    cfg_file.write_text(MINIMAL_YAML + extra, encoding="utf-8")
-    return cfg_file
-
-
-def test_pipeline_defaults_to_core_stages(tmp_path: Path) -> None:
-    assert load_config(_write(tmp_path, "")).pipeline.stages == ("audio", "stt")
-
-
-def test_pipeline_stages_can_be_extended(tmp_path: Path) -> None:
-    """`render` needs no config section, so it extends the list on its own."""
-    cfg = load_config(_write(tmp_path, "\npipeline:\n  stages: [audio, stt, render]\n"))
-
-    assert cfg.pipeline.stages == ("audio", "stt", "render")
-
-
-def test_pipeline_rejects_unknown_stage(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="unknown stage"):
-        load_config(_write(tmp_path, "\npipeline:\n  stages: [audio, telepathy]\n"))
-
-
-def test_pipeline_rejects_out_of_order_stages(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="order"):
-        load_config(_write(tmp_path, "\npipeline:\n  stages: [publish, audio]\n"))
-
-
-def test_pipeline_rejects_duplicate_stages(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="duplicates"):
-        load_config(_write(tmp_path, "\npipeline:\n  stages: [audio, audio, stt]\n"))
-
-
-def test_pipeline_rejects_empty_stage_list(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="at least one"):
-        load_config(_write(tmp_path, "\npipeline:\n  stages: []\n"))
-
-
-CONFLUENCE_YAML = """
-confluence:
-  base_url: https://wiki.corp.local
-  space_key: CALLS
-  parent_page_id: "123456"
-  compliance_group: callrec-compliance
-"""
-
-MAIL_YAML = """
-mail:
-  smtp_host: smtp.corp.local
-  from_address: jabberscribe@corp.local
-  fallback_to: it-ops@corp.local
-"""
-
-
-def test_delivery_config_is_absent_by_default(tmp_path: Path) -> None:
-    cfg = load_config(_write(tmp_path, ""))
-
-    assert cfg.confluence is None
-    assert cfg.mail is None
-    assert cfg.retention.audio_days == 90
-    assert cfg.retention.page_days == 365
-
-
-def test_confluence_config_parses(tmp_path: Path) -> None:
-    cfg = load_config(_write(tmp_path, CONFLUENCE_YAML))
-
-    assert cfg.confluence.base_url == "https://wiki.corp.local"
-    assert cfg.confluence.space_key == "CALLS"
-    assert cfg.confluence.parent_page_id == "123456"
-    assert cfg.confluence.attach_audio is False
-
-
-def test_publish_stage_without_confluence_config_is_rejected(tmp_path: Path) -> None:
-    extra = "\npipeline:\n  stages: [audio, stt, render, publish]\n"
+def test_v1_delivery_sections_are_rejected(tmp_path: Path) -> None:
+    data = copy.deepcopy(BASE)
+    data["confluence"] = {"base_url": "https://wiki"}
 
     with pytest.raises(ConfigError, match="confluence"):
-        load_config(_write(tmp_path, extra))
+        load_config(_write(tmp_path, data))
 
 
-def test_notify_stage_without_mail_config_is_rejected(tmp_path: Path) -> None:
-    extra = "\npipeline:\n  stages: [audio, stt, render, publish, notify]\n" + CONFLUENCE_YAML
-
-    with pytest.raises(ConfigError, match="mail"):
-        load_config(_write(tmp_path, extra))
+def test_missing_file(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="not found"):
+        load_config(tmp_path / "missing.yaml")
 
 
-def test_full_delivery_pipeline_config_is_accepted(tmp_path: Path) -> None:
-    extra = "\npipeline:\n  stages: [audio, stt, render, publish, notify]\n" + CONFLUENCE_YAML + MAIL_YAML
+def test_invalid_yaml(tmp_path: Path) -> None:
+    path = tmp_path / "cfg.yaml"
+    path.write_text("paths: [unclosed", encoding="utf-8")
 
-    cfg = load_config(_write(tmp_path, extra))
+    with pytest.raises(ConfigError, match="not valid YAML"):
+        load_config(path)
 
-    assert cfg.pipeline.stages == ("audio", "stt", "render", "publish", "notify")
-    assert cfg.mail.smtp_port == 25
+
+def test_top_level_must_be_mapping(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="mapping"):
+        load_config(_write(tmp_path, ["a", "b"]))

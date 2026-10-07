@@ -7,12 +7,9 @@ that need them. This file is safe to commit and safe to log.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
-
-from jabberscribe.jobs import STAGE_ORDER
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 
 class ConfigError(Exception):
@@ -26,7 +23,8 @@ class _Strict(BaseModel):
 class PathsConfig(_Strict):
     drop_root: Path
     work_dir: Path
-    audio_store: Path
+    #: Per-call output folders: out_root/<YYYY>/<MM>/<job_key>/.
+    out_root: Path
     db_path: Path
 
     @property
@@ -43,87 +41,42 @@ class WatcherConfig(_Strict):
     min_age_seconds: int = 15
 
 
+class GroupConfig(_Strict):
+    #: A conference is processed once no new copy has arrived for this long...
+    settle_seconds: int = 60
+    #: ...or once its first copy has waited this long, to hold the latency budget.
+    max_wait_seconds: int = 300
+
+
+class LiteLLMConfig(_Strict):
+    base_url: str
+    timeout_seconds: float = 600.0
+
+
 class SttConfig(_Strict):
-    model: str = "ivrit-ai/whisper-large-v3-turbo-ct2"
-    compute_type: str = "int8"
-    device: Literal["auto", "cpu", "cuda"] = "auto"
+    #: The model_name LiteLLM serves for ivrit.ai Whisper.
+    model: str
     vocabulary_file: Path | None = None
 
 
-class PipelineConfig(_Strict):
-    """Which stages this deployment runs, in order.
-
-    This is the activation switch for the whole system. The core stages ship
-    first; each outer stage becomes available by adding its name here once it
-    exists. `doctor` reports any stage that is enabled but not yet implemented,
-    so turning one on early tells you so instead of failing mid-call.
-    """
-
-    stages: tuple[str, ...] = ("audio", "stt")
-
-    @field_validator("stages")
-    @classmethod
-    def _validate_stages(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if not value:
-            raise ValueError("pipeline.stages must list at least one stage")
-        unknown = [s for s in value if s not in STAGE_ORDER]
-        if unknown:
-            raise ValueError(f"pipeline.stages contains unknown stage(s) {unknown}; valid stages are {STAGE_ORDER}")
-        if len(set(value)) != len(value):
-            raise ValueError(f"pipeline.stages contains duplicates: {value}")
-        positions = [STAGE_ORDER.index(s) for s in value]
-        if positions != sorted(positions):
-            raise ValueError(f"pipeline.stages must follow the order {STAGE_ORDER}, got {value}")
-        return value
-
-
-class ConfluenceConfig(_Strict):
-    base_url: str
-    space_key: str
-    parent_page_id: str
-    compliance_group: str | None = None
-    # Attaching voice recordings to a wiki multiplies the exposure surface for no
-    # reading benefit, so the page links the audio instead by default.
-    attach_audio: bool = False
-
-
-class MailConfig(_Strict):
-    smtp_host: str
-    smtp_port: int = 25
-    use_tls: bool = False
-    from_address: str
-    compliance_bcc: str | None = None
-    ops_alert_to: str | None = None
-    #: Where a transcript goes when no participant email could be resolved.
-    fallback_to: str
+class SummaryConfig(_Strict):
+    #: The model_name LiteLLM serves for Gemma.
+    model: str
 
 
 class RetentionConfig(_Strict):
     audio_days: int = 90
-    page_days: int = 365
+    text_days: int = 365
 
 
 class Config(_Strict):
     paths: PathsConfig
     watcher: WatcherConfig = WatcherConfig()
-    stt: SttConfig = SttConfig()
-    pipeline: PipelineConfig = PipelineConfig()
-    confluence: ConfluenceConfig | None = None
-    mail: MailConfig | None = None
+    group: GroupConfig = GroupConfig()
+    litellm: LiteLLMConfig
+    stt: SttConfig
+    summary: SummaryConfig
     retention: RetentionConfig = RetentionConfig()
-
-    @model_validator(mode="after")
-    def _require_config_for_enabled_stages(self) -> Config:
-        """A stage cannot be enabled without the config it needs.
-
-        Catching this at load beats discovering it when the first real call
-        reaches the publish stage.
-        """
-        if "publish" in self.pipeline.stages and self.confluence is None:
-            raise ValueError("pipeline.stages enables 'publish' but no confluence: section is configured")
-        if "notify" in self.pipeline.stages and self.mail is None:
-            raise ValueError("pipeline.stages enables 'notify' but no mail: section is configured")
-        return self
 
 
 def load_config(path: Path) -> Config:

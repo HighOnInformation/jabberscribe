@@ -59,10 +59,12 @@ def test_shares_a_database_with_the_job_store(tmp_path: Path) -> None:
     log.init_schema()
 
     store.create(
+        job_key="c1",
         call_id="c1",
+        conference_id=None,
         audio_path=Path("/a.wav"),
+        out_dir=Path("/out/c1"),
         sidecar_json="{}",
-        kind="call",
         started_at="2026-08-12T14:03:11+03:00",
         duration_sec=5,
     )
