@@ -27,6 +27,7 @@ from pathlib import Path
 
 import httpx
 
+from jabberscribe.alerts import LITELLM_DOWN, PURGE_ERRORS, Alerter, check_jobs, make_alerter, probe_litellm
 from jabberscribe.audit import LEGAL_HOLD_RELEASED, LEGAL_HOLD_SET, AuditLog
 from jabberscribe.config import Config, ConfigError, load_config
 from jabberscribe.cues import Tagger, load_tagger, unavailable_reason
@@ -258,8 +259,14 @@ def _process(cfg: Config, store: JobStore, audit: AuditLog, audio: Path, sidecar
     return 0 if target.status == DONE else 1
 
 
+def _alert_purge(alerter: Alerter | None, errors: tuple[str, ...]) -> None:
+    if alerter is not None and errors:
+        alerter.send(PURGE_ERRORS, f"{len(errors)} purge problem(s); first: {errors[0]}", _utcnow())
+
+
 def _report_purge(cfg: Config, store: JobStore, audit: AuditLog) -> int:
     result = purge(cfg, store, audit, now=datetime.now(UTC))
+    _alert_purge(make_alerter(cfg), result.errors)
     print(f"audio deleted: {len(result.audio_deleted)}")
     print(f"text deleted: {len(result.text_deleted)}")
     print(f"leftovers swept: {len(result.swept)}")
@@ -269,8 +276,19 @@ def _report_purge(cfg: Config, store: JobStore, audit: AuditLog) -> int:
     return 1 if result.errors else 0
 
 
+def _watch(cfg: Config, store: JobStore, alerter: Alerter, client: httpx.Client) -> None:
+    """After a poll: alert on new failures, an old backlog, and an unreachable LiteLLM."""
+    now = _utcnow()
+    check_jobs(store, alerter, now, cfg.alerts.backlog_minutes)
+    problem = probe_litellm(client)
+    if problem is not None:
+        alerter.send(LITELLM_DOWN, f"{cfg.litellm.base_url}: {problem}", now)
+
+
 def _serve(cfg: Config, store: JobStore, audit: AuditLog, once: bool) -> int:
-    transcriber, summarizer, tagger = _workers(cfg, make_client(cfg.litellm))
+    client = make_client(cfg.litellm)
+    transcriber, summarizer, tagger = _workers(cfg, client)
+    alerter = make_alerter(cfg)
     last_purge: date | None = None
     polls = 0
     while True:
@@ -295,8 +313,15 @@ def _serve(cfg: Config, store: JobStore, audit: AuditLog, once: bool) -> int:
                 result = purge(cfg, store, audit, now=_utcnow())
                 for problem in result.errors:
                     log.error("purge: %s", problem)
+                _alert_purge(alerter, result.errors)
             except Exception:
                 log.exception("purge failed; next attempt tomorrow")
+                ok = False
+        if alerter is not None:
+            try:
+                _watch(cfg, store, alerter, client)
+            except Exception:
+                log.exception("alert checks failed; continuing")
                 ok = False
         polls += 1
         _beat(cfg, store, polls, ok)
@@ -446,6 +471,11 @@ def main(argv: list[str] | None = None) -> int:
         checks = doctor(cfg, make_client(cfg.litellm))
         for check in checks:
             print(f"[{'OK ' if check.ok else 'FAIL'}] {check.name}: {check.detail}")
+        down = [c for c in checks if c.name.startswith("litellm") and not c.ok]
+        alerter = make_alerter(cfg)
+        if alerter is not None and down:
+            details = "; ".join(f"{c.name}: {c.detail}" for c in down)
+            alerter.send(LITELLM_DOWN, f"doctor: {details}", _utcnow())
         return 0 if all(c.ok for c in checks) else 1
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")

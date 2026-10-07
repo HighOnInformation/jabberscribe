@@ -84,6 +84,13 @@ class CuesConfig(_Strict):
     threshold: float = Field(default=0.3, gt=0, lt=1)
 
 
+class AlertsConfig(_Strict):
+    #: Where alerts are POSTed (JSON). None disables alerting. JABBERSCRIBE_ALERT_WEBHOOK_URL overrides it.
+    webhook_url: str | None = None
+    #: Alert when the oldest unfinished call arrived longer ago than this.
+    backlog_minutes: int = 15
+
+
 class RetentionConfig(_Strict):
     audio_days: int = 90
     text_days: int = 365
@@ -98,6 +105,7 @@ class Config(_Strict):
     summary: SummaryConfig
     retention: RetentionConfig = RetentionConfig()
     cues: CuesConfig = CuesConfig()
+    alerts: AlertsConfig = AlertsConfig()
 
 
 def load_config(path: Path) -> Config:

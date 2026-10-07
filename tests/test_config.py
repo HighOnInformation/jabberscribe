@@ -146,3 +146,9 @@ def test_cues_threshold_must_be_a_probability(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="threshold"):
         load_config(_write(tmp_path, data))
+
+
+def test_alerts_are_off_by_default(tmp_path: Path) -> None:
+    cfg = load_config(_write(tmp_path, BASE))
+
+    assert (cfg.alerts.webhook_url, cfg.alerts.backlog_minutes) == (None, 15)
