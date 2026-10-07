@@ -93,7 +93,7 @@ def test_result_json_contents(tmp_path: Path, make_sidecar) -> None:
     assert result["owners"] == [{"extension": "1042", "user": "meir", "display_name": "מאיר"}]
     assert result["parties"] == [{"extension": "2210", "user": None, "display_name": "דנה"}]
     assert result["recording"] == "recording.wav"
-    assert result["transcript"][1] == {"start": 61.0, "end": 62.5, "text": "נדבר מחר"}
+    assert result["transcript"][1] == {"start": 61.0, "end": 62.5, "text": "נדבר מחר", "speaker": None}
     assert result["summary_available"] is True
     assert result["action_items"] == [{"task": "לשלוח | לבדוק", "owner": None, "due": "מחר", "source_ts": "00:01:01"}]
     assert result["models"] == MODELS
@@ -171,3 +171,23 @@ def test_write_atomic_gives_up_and_cleans_up(tmp_path: Path, monkeypatch) -> Non
 
     assert len(calls) == REPLACE_ATTEMPTS
     assert list(tmp_path.iterdir()) == []
+
+
+def test_labelled_segments_name_their_speaker(tmp_path: Path, make_sidecar) -> None:
+    sidecar = parse_sidecar(make_sidecar(tmp_path / "s.json", call_id="gc1").read_text(encoding="utf-8"))
+    out = tmp_path / "out"
+
+    write_outputs(
+        out,
+        sidecar=sidecar,
+        segments=[Segment(0.0, 1.0, "שלום", "מאיר"), Segment(2.0, 3.0, "היי", "דנה")],
+        summary=SUMMARY,
+        owners=[sidecar.line_owner],
+        models=MODELS,
+        recording=out / "recording.wav",
+    )
+
+    text = _read(out / TRANSCRIPT_FILE)
+    assert "[00:00:00] מאיר: שלום" in text
+    assert "[00:00:02] דנה: היי" in text
+    assert json.loads(_read(out / RESULT_FILE))["transcript"][0]["speaker"] == "מאיר"

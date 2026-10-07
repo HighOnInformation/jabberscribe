@@ -7,6 +7,7 @@ that need them. This file is safe to commit and safe to log.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -61,6 +62,10 @@ class SttConfig(_Strict):
     model: str
     #: A relative path is relative to the config file, not the working directory.
     vocabulary_file: Path | None = None
+    #: Dual-track calls: transcribe each channel on its own and label who spoke (two STT calls per call).
+    split_channels: bool = True
+    #: The channel of a dual-track recording that carries the recorded line (the near end).
+    near_channel: Literal[0, 1] = 0
 
 
 class SummaryConfig(_Strict):

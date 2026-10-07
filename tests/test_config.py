@@ -111,3 +111,17 @@ def test_shipped_config_is_valid() -> None:
     assert cfg.retention.text_days == 365
     assert cfg.stt.vocabulary_file == shipped.parent / "custom_vocabulary.txt"
     assert cfg.stt.vocabulary_file.is_file()
+
+
+def test_speaker_split_defaults(tmp_path: Path) -> None:
+    cfg = load_config(_write(tmp_path, BASE))
+
+    assert (cfg.stt.split_channels, cfg.stt.near_channel) == (True, 0)
+
+
+def test_near_channel_must_be_zero_or_one(tmp_path: Path) -> None:
+    data = copy.deepcopy(BASE)
+    data["stt"]["near_channel"] = 2
+
+    with pytest.raises(ConfigError, match="near_channel"):
+        load_config(_write(tmp_path, data))

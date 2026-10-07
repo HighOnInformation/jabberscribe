@@ -203,7 +203,7 @@ def test_reprocessing_the_same_call_is_a_no_op(tmp_path, cfg_file, fake_litellm,
     assert main(["--config", str(cfg_file), "process", str(audio), str(sidecar)]) == 0
     assert main(["--config", str(cfg_file), "process", str(audio), str(sidecar)]) == 0
 
-    assert fake_litellm.transcriptions == 1
+    assert fake_litellm.transcriptions == 2  # one per channel of the dual-track call, and only once
     assert len(JobStore(tmp_path / "js.db").list_all()) == 1
 
 

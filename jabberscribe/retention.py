@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from jabberscribe.audio import STT_FILENAME
+from jabberscribe.audio import STT_GLOB
 from jabberscribe.audit import (
     PURGE_FAILED_JOB,
     PURGED_AUDIO,
@@ -182,7 +182,7 @@ def purge(cfg: Config, store: JobStore, audit: AuditLog, now: datetime) -> Purge
             errors.append(f"{job.job_key}: database error: {exc}")
 
     stt_copies = [
-        p for d in cfg.paths.work_dir.glob("*") if d.name not in active_keys for p in d.glob(f"{STT_FILENAME}*")
+        p for d in cfg.paths.work_dir.glob("*") if d.name not in active_keys for p in d.glob(STT_GLOB)
     ]
     swept, sweep_errors = _sweep(stt_copies, STT_LEFTOVER_DAYS, now, PURGED_STT_AUDIO, audit, lambda p: p.parent.name)
     errors += sweep_errors

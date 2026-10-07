@@ -33,7 +33,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from jabberscribe.llm import post
-from jabberscribe.stt import Segment, format_ts
+from jabberscribe.stt import Segment, segment_line
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +54,10 @@ Return only a JSON object with this shape:
 Rules:
 - owner and due: fill them only when explicitly stated in the call; otherwise null. Never guess.
 - source_ts: the timestamp of the transcript line the item comes from, copied exactly.
+- A line may name its speaker before a colon. When a speaker named by a real name commits to a task in the
+  first person ("אני אשלח", "I will send it"), that name is the stated owner.
+- צד א, צד ב and משתתפים are generic labels, not names: a first-person commitment on such a line does not
+  state an owner. Leave owner null unless a name is said in the call.
 - If there are no action items, return an empty list."""
 
 MERGE_INSTRUCTIONS = """You merge the partial summaries of one Hebrew call, given in order, into one summary.
@@ -107,7 +111,7 @@ class _MergeModel(BaseModel):
 
 
 def transcript_text(segments: list[Segment]) -> str:
-    return "\n".join(f"[{format_ts(s.start)}] {s.text}" for s in segments)
+    return "\n".join(segment_line(s) for s in segments)
 
 
 def chunk_segments(segments: list[Segment], max_chars: int) -> list[list[Segment]]:

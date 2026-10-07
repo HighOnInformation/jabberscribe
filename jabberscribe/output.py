@@ -17,7 +17,7 @@ from pathlib import Path
 
 from jabberscribe.jobs import utcnow
 from jabberscribe.sidecar import Party, Sidecar
-from jabberscribe.stt import Segment, format_ts
+from jabberscribe.stt import Segment, segment_line
 from jabberscribe.summarize import Summary
 
 TRANSCRIPT_FILE = "transcript.md"
@@ -63,7 +63,7 @@ def _cell(value: str | None) -> str:
 
 def _render_transcript(segments: list[Segment]) -> str:
     # Blank lines between segments: consecutive Markdown lines would merge into one paragraph.
-    lines = [f"[{format_ts(s.start)}] {s.text}" for s in segments]
+    lines = [segment_line(s) for s in segments]
     return _rtl("# תמליל\n\n" + "\n\n".join(lines) + "\n")
 
 

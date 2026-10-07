@@ -31,13 +31,14 @@ from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from jabberscribe.audio import STT_FILENAME, prepare_for_stt
+from jabberscribe.audio import STT_GLOB
 from jabberscribe.config import Config
 from jabberscribe.group import owners_for
 from jabberscribe.jobs import DONE, FAILED, Job, JobStore, next_stage
 from jabberscribe.llm import TransientError
 from jabberscribe.output import RESULT_FILE, write_atomic, write_outputs
 from jabberscribe.sidecar import Sidecar, parse_sidecar
+from jabberscribe.speakers import stt_inputs, transcribe_inputs
 from jabberscribe.stt import Segment, Transcriber
 from jabberscribe.summarize import ActionItem, Summarizer, Summary, SummaryUnavailable
 
@@ -102,8 +103,8 @@ def _hangup(sidecar: Sidecar) -> datetime:
 
 def _delete_stt_audio(work: Path) -> None:
     # The Opus copy is the voice too; it must not outlive the recording's retention.
-    (work / STT_FILENAME).unlink(missing_ok=True)
-    (work / f"{STT_FILENAME}.part").unlink(missing_ok=True)
+    for leftover in work.glob(STT_GLOB):
+        leftover.unlink(missing_ok=True)
 
 
 def process_job(
@@ -131,9 +132,10 @@ def process_job(
             log.info("%s: stage %s", job.job_key, stage)
             began = time.monotonic()
             if stage == "audio":
-                prepare_for_stt(job.audio_path, work)
+                stt_inputs(job.audio_path, work, sidecar, cfg.stt)
             elif stage == "stt":
-                _write_segments(segments_path, transcriber.transcribe(prepare_for_stt(job.audio_path, work)))
+                inputs = stt_inputs(job.audio_path, work, sidecar, cfg.stt)
+                _write_segments(segments_path, transcribe_inputs(transcriber, inputs))
                 _delete_stt_audio(work)
             elif stage == "summarize":
                 _write_summary(summary_path, *_summarize(summarizer, _read_segments(segments_path)))

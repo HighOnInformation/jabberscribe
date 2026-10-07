@@ -42,6 +42,8 @@ class Segment:
     start: float
     end: float
     text: str
+    #: Who spoke, when the channel tells us (dual-track calls); None for a downmix.
+    speaker: str | None = None
 
 
 class Transcriber(Protocol):
@@ -63,6 +65,12 @@ def build_prompt(vocabulary: str | None) -> str:
 def format_ts(seconds: float) -> str:
     total = int(seconds)
     return f"{total // 3600:02d}:{total % 3600 // 60:02d}:{total % 60:02d}"
+
+
+def segment_line(segment: Segment) -> str:
+    """One transcript line: `[HH:MM:SS] text`, or `[HH:MM:SS] speaker: text` when the speaker is known."""
+    words = f"{segment.speaker}: {segment.text}" if segment.speaker else segment.text
+    return f"[{format_ts(segment.start)}] {words}"
 
 
 def is_hallucination(raw: dict, text: str, prompt: str) -> bool:

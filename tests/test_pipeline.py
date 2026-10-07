@@ -53,10 +53,14 @@ class ExplodingSummarizer:
         raise RuntimeError("summarizer bug")
 
 
-def _enqueue(cfg, store, audit, make_wav, make_sidecar, *, call_id="abc", extension="1042", **extra) -> str:
+def _enqueue(
+    cfg, store, audit, make_wav, make_sidecar, *, call_id="abc", extension="1042", tracks="mixed", **extra
+) -> str:
+    # Two-channel audio either way. "mixed" keeps the one-downmix route these tests were written for;
+    # the dual-track speaker route has its own tests below.
     make_wav(cfg.paths.inbox / f"{call_id}{extension}.wav", channels=2)
     make_sidecar(
-        cfg.paths.inbox / f"{call_id}{extension}.json", call_id=call_id, extension=extension, tracks="dual", **extra
+        cfg.paths.inbox / f"{call_id}{extension}.json", call_id=call_id, extension=extension, tracks=tracks, **extra
     )
     scan_once(cfg, store, audit, min_age_seconds=0)
     return f"{call_id}_{extension}"
@@ -444,3 +448,36 @@ def test_output_records_the_latency_for_status(cfg, store, audit, make_wav, make
     job = store.get(key)
     assert job.latency_sec == _result(job)["timings"]["hangup_to_output_sec"]
     assert job.output_at is not None
+
+
+class ChannelTranscriber(FakeTranscriber):
+    """Answers each channel file with one line named after it, the far end one second later."""
+
+    def transcribe(self, audio: Path) -> list[Segment]:
+        self.calls.append(audio)
+        start = 0.0 if audio.name == "stt-ch0.ogg" else 1.0
+        return [Segment(start, start + 0.5, audio.stem)]
+
+
+def test_dual_track_call_is_labelled_near_and_far(cfg, store, audit, make_wav, make_sidecar) -> None:
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar, tracks="dual")
+    transcriber = ChannelTranscriber()
+    summarizer = FakeSummarizer()
+
+    run_once(cfg, store, transcriber, summarizer)
+
+    job = store.get(key)
+    assert [p.name for p in transcriber.calls] == ["stt-ch0.ogg", "stt-ch1.ogg"]
+    transcript = _result(job)["transcript"]
+    assert [(s["speaker"], s["text"]) for s in transcript] == [("מאיר", "stt-ch0"), ("דנה", "stt-ch1")]
+    assert "[00:00:00] מאיר: stt-ch0" in (job.out_dir / TRANSCRIPT_FILE).read_text(encoding="utf-8")
+    assert [s.speaker for s in summarizer.seen] == ["מאיר", "דנה"]
+    assert list((cfg.paths.work_dir / key).glob("stt*.ogg*")) == []
+
+
+def test_mixed_track_call_has_no_speakers(cfg, store, audit, make_wav, make_sidecar) -> None:
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+
+    run_once(cfg, store, FakeTranscriber(), FakeSummarizer())
+
+    assert [s["speaker"] for s in _result(store.get(key))["transcript"]] == [None, None]

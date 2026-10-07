@@ -247,3 +247,30 @@ def test_parse_turns_blank_owner_and_due_into_none() -> None:
 def test_parse_rejects_invalid_documents(doc: dict) -> None:
     with pytest.raises(ValueError):
         parse_summary(json.dumps(doc))
+
+
+def test_transcript_text_names_known_speakers() -> None:
+    segments = [Segment(0.0, 1.0, "שלום", "מאיר"), Segment(2.0, 3.0, "היי")]
+
+    assert transcript_text(segments) == "[00:00:00] מאיר: שלום\n[00:00:02] היי"
+
+
+def test_prompt_explains_speaker_names() -> None:
+    server = Server(GOOD_JSON)
+
+    _summarizer(server).summarize([Segment(0.0, 1.0, "אני אשלח את הדוח", "דנה")])
+
+    content = server.requests[0]["messages"][0]["content"]
+    assert "[00:00:00] דנה: אני אשלח את הדוח" in content
+    assert "first person" in content
+
+
+def test_generic_speaker_labels_never_state_an_owner() -> None:
+    """Owner only when stated: "I will" on a fallback-labelled line names nobody."""
+    from jabberscribe.speakers import CONFERENCE_FAR, FAR_FALLBACK, NEAR_FALLBACK
+    from jabberscribe.summarize import INSTRUCTIONS
+
+    generic_rule = next(line for line in INSTRUCTIONS.splitlines() if "generic labels" in line)
+    for label in (NEAR_FALLBACK, FAR_FALLBACK, CONFERENCE_FAR):
+        assert label in generic_rule
+    assert "real name" in INSTRUCTIONS
