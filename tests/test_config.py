@@ -152,3 +152,15 @@ def test_alerts_are_off_by_default(tmp_path: Path) -> None:
     cfg = load_config(_write(tmp_path, BASE))
 
     assert (cfg.alerts.webhook_url, cfg.alerts.backlog_minutes) == (None, 15)
+
+
+def test_shipped_config_spells_out_the_extras() -> None:
+    shipped = Path(__file__).resolve().parent.parent / "config" / "jabberscribe.yaml"
+
+    cfg = load_config(shipped)
+
+    assert (cfg.stt.split_channels, cfg.stt.near_channel) == (True, 0)
+    assert cfg.cues.enabled is True
+    assert cfg.cues.model_path == shipped.parent / "models" / "Cnn14_mAP=0.431.pth"
+    assert cfg.cues.threshold == 0.3
+    assert (cfg.alerts.webhook_url, cfg.alerts.backlog_minutes) == (None, 15)

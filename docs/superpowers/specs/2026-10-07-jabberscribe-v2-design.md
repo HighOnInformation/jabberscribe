@@ -34,6 +34,12 @@ labels are extras that come after.
    by timestamp. Intonation cues are out of reach of this approach.
 4. **Speaker labels** — near/far end from the two channels, or diarization.
 
+Status (extras plan, 2026-10-08): bracket cues (as a separate layer,
+`transcript_cues.md`; `transcript.md` stays strict verbatim) and near/far
+speaker labels for dual-track calls are built, together with legal hold,
+admin alerts and a heartbeat. Conference diarization, the SSO web app and
+email wait for the owner decisions listed in the extras plan's design notes.
+
 ### 2.3 Non-goals
 
 - Live (in-call) transcription.

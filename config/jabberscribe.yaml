@@ -1,11 +1,13 @@
 # JabberScribe v2 configuration. Secrets come from environment variables, never here:
-#   JABBERSCRIBE_LITELLM_KEY   LiteLLM API key (leave unset if the server has no auth)
+#   JABBERSCRIBE_LITELLM_KEY         LiteLLM API key (leave unset if the server has no auth)
+#   JABBERSCRIBE_ALERT_WEBHOOK_URL   alert webhook; overrides alerts.webhook_url (such URLs often embed a secret)
+#   JABBERSCRIBE_ALERT_TOKEN         optional bearer token for the alert webhook
 # Run the service with an absolute --config path: a Windows service starts in C:\Windows\System32.
 paths:
   drop_root: D:/jabberscribe/drop          # the recorder writes into drop_root/inbox
   work_dir: D:/jabberscribe/work
   out_root: D:/jabberscribe/out            # out/<YYYY>/<MM>/<call>/ -- readable company-wide in the MVP
-  db_path: D:/jabberscribe/jabberscribe-v2.db   # a fresh file: v2 refuses databases from other versions
+  db_path: D:/jabberscribe/jabberscribe-v2.db   # v2 upgrades its own older schema in place; refuses any other
 
 watcher:
   poll_seconds: 30
@@ -29,6 +31,10 @@ litellm:
 stt:
   model: whisper-he
   vocabulary_file: custom_vocabulary.txt    # relative to this file
+  # Dual-track calls: transcribe each channel separately (two STT calls) and label who spoke,
+  # near end = the recorded line's display name, far end = the other party's (generic labels if missing).
+  split_channels: true
+  near_channel: 0                           # the channel that carries the recorded line; check your recorder
 
 summary:
   model: gemma-3
@@ -37,3 +43,18 @@ summary:
 retention:
   audio_days: 90
   text_days: 365
+
+# Bracket cues ([צחוק], [מוזיקה], ...) as a separate layer: result.json "cues" and transcript_cues.md;
+# transcript.md stays strict verbatim. Needs `pip install .[cues]`, the PANNs checkpoint at model_path,
+# and class_labels_indices.csv in %USERPROFILE%\panns_data\ of the service account. Nothing is downloaded:
+# without any of them the cues stage is skipped (logged) and calls go out without cues.
+cues:
+  enabled: true
+  model_path: models/Cnn14_mAP=0.431.pth   # relative to this file; models/ is git-ignored
+  threshold: 0.3
+
+# Operator alerts, OFF by default: one JSON POST per kind (job_failed, backlog, litellm_down, purge_errors),
+# at most once an hour each. Payloads carry job keys and counts, never names or call content.
+alerts:
+  webhook_url: null                         # null = off; or set JABBERSCRIBE_ALERT_WEBHOOK_URL
+  backlog_minutes: 15

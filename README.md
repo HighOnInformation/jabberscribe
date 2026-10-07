@@ -10,7 +10,8 @@ and summarization (Gemma) both run behind the on-prem LiteLLM server.
 
 ## Status
 
-v2 MVP pipeline. Capture — CUCM media forking to a SIPREC recorder — is
+v2 MVP pipeline plus the first extras: near/far speaker labels, bracket cues,
+legal hold, alerts and a heartbeat. Capture — CUCM media forking to a SIPREC recorder — is
 designed (see the spec) but not built; until it is, recordings are dropped in
 by hand or by any recorder that follows the drop contract.
 
@@ -19,12 +20,15 @@ jabberscribe --config D:/jabberscribe/jabberscribe.yaml doctor     # ffmpeg, pat
 jabberscribe --config ... process call.wav call.json   # one recording, end to end (only that job; exit 0 only if it is DONE)
 jabberscribe --config ... run                          # watch the inbox; purges once a day
 jabberscribe --config ... purge                        # delete past-retention audio and text now
-jabberscribe --config ... status                       # backlog, retrying and failed jobs (exit 1 if any failure is unresolved)
+jabberscribe --config ... status                       # backlog, latency p50/p95, heartbeat, retrying, failed and held jobs (exit 1 if any failure is unresolved)
 jabberscribe --config ... retry <job_key>              # give a failed job fresh attempts
 jabberscribe --config ... retry --failed               # ... every failed job
+jabberscribe --config ... hold <job_key> --reason "…"  # legal hold: purge keeps the call and its conference
+jabberscribe --config ... unhold <job_key>             # release it; retention applies again
 ```
 
-Secrets come from the environment, never from config: `JABBERSCRIBE_LITELLM_KEY`.
+Secrets come from the environment, never from config: `JABBERSCRIBE_LITELLM_KEY`,
+`JABBERSCRIBE_ALERT_WEBHOOK_URL`, `JABBERSCRIBE_ALERT_TOKEN`.
 
 ## Running as a service
 
@@ -61,9 +65,26 @@ and no response cache to the Whisper and Gemma routes.
 ## Output
 
 `out/<YYYY>/<MM>/<call>/` holds `recording.wav`, `transcript.md`,
-`summary.md`, `actions.md`, and `result.json` (everything, structured, with
-owners, models and stage timings — the contract for the future web app). The
-Markdown files are wrapped in `<div dir="rtl">` so Hebrew renders right to left.
+`transcript_cues.md`, `summary.md`, `actions.md`, and `result.json`
+(everything, structured, with owners, models, stage timings, speakers and cues
+— the contract for the future web app). The Markdown files are wrapped in
+`<div dir="rtl">` so Hebrew renders right to left.
+
+**Speaker labels.** A dual-track call is transcribed one channel at a time,
+and every line names its speaker: `[00:03:12] מאיר חדד: ...`. The near end
+(channel `stt.near_channel`) is the recorded line's `display_name`; the far end
+is the other party's on a 1:1 call, `משתתפים` on a conference (no
+diarization), and `צד א` / `צד ב` when a name is missing. A silent channel is
+not transcribed. Mixed-track calls carry no labels. `stt.split_channels: false`
+turns this off (one STT call per call instead of two).
+
+**Bracket cues.** With `pip install .[cues]`, the PANNs checkpoint at
+`cues.model_path` and the AudioSet label file in the service account's
+`%USERPROFILE%\panns_data\`, a local CPU tagger marks `[צחוק]`, `[רעש רקע]`,
+`[מוזיקה]`, `[שקט]` (6 s or longer), `[הקלדה]` and `[צלצול]`. Cues go to
+`result.json` (`cues`, `cues_available`) and `transcript_cues.md`;
+`transcript.md` stays strict verbatim. Without the extra the stage is skipped
+(see `doctor`'s `cues` line) and nothing fails.
 
 A conference produces one output owned by every participating line. If a
 longer copy of the meeting arrives after a shorter one was processed (it ends
@@ -92,6 +113,31 @@ database's `audit_log` table. Backups and Volume Shadow Copies ("Previous
 Versions") of the share keep deleted audio; align their retention with these
 windows.
 
+**Legal hold.** `jabberscribe hold <job_key> --reason "<case>"` exempts a call
+— and every copy of its conference — from purge until `jabberscribe unhold`.
+A held conference's earlier output is also kept when a longer copy replaces
+it. Every hold and release is audited with the OS account that ran it;
+`status` lists the held calls.
+
+## Monitoring
+
+`run` rewrites `heartbeat.json` next to the database after every poll (last
+poll time, poll count, job counts, age of the oldest unfinished call); alarm on
+its age with any file-age monitor. `status` adds the hang-up-to-output latency
+of the last 24 hours (p50 and p95; the budget is 15 min) and the heartbeat age.
+
+Alerts are off by default. Set `alerts.webhook_url` (or
+`JABBERSCRIBE_ALERT_WEBHOOK_URL`) to get a JSON POST, with a `text` field Teams
+and Slack render as is, when a call fails, when a call has waited more than
+`alerts.backlog_minutes`, when LiteLLM does not answer (`run` probes it every
+poll; `doctor` alerts too), or when the purge cannot delete something. Each
+kind is sent at most once an hour. Delivery never raises: a failed delivery is
+logged (status code or error type only — the webhook URL is never logged) and
+that kind is not retried for 5 minutes. Alerts carry job keys and counts, never
+names or call content (a purge alert says only how many problems occurred and
+"see service log") — but a cloud webhook does take the job keys (call id +
+extension) outside the network.
+
 ## Drop contract
 
 The recorder writes `<name>.wav.part`, renames it to `<name>.wav`, then writes
@@ -108,8 +154,9 @@ JABBERSCRIBE_LIVE_CONFIG=config/jabberscribe.yaml JABBERSCRIBE_LIVE_CLIP=clip.wa
 ```
 
 See [the v2 spec](docs/superpowers/specs/2026-10-07-jabberscribe-v2-design.md),
-[the v2 pipeline plan](docs/superpowers/plans/2026-10-07-v2-pipeline.md) (Tasks 1–7)
-and [the hardened plan](docs/superpowers/plans/2026-10-08-v2-hardened-tasks.md) (Tasks 8–19).
+[the v2 pipeline plan](docs/superpowers/plans/2026-10-07-v2-pipeline.md) (Tasks 1–7),
+[the hardened plan](docs/superpowers/plans/2026-10-08-v2-hardened-tasks.md) (Tasks 8–19)
+and [the extras plan](docs/superpowers/plans/2026-10-08-v2-extras-tasks.md) (Tasks E1–E7).
 
 ## Language
 
