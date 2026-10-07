@@ -110,6 +110,7 @@ File name base: `jabberscribe.sidecar.job_key(call_id, extension)`.
 | Other 4xx on one recording, empty link, ffprobe/ffmpeg failure | Recording's attempt count increments; retried next poll; parked after `max_attempts` (default 5). |
 | Crash mid-export | Only `.part` files or the work-dir MP3 remain; they are overwritten on retry. The watcher ignores `.part` files and a `.wav` without a `.json`. |
 | Any error before the sidecar rename | No `.json` appears, so the watcher never sees a partial pair; leftover `.wav.part` is removed. |
+| Metadata 403/404 | Degrades to no metadata (display name from the party, no participant count); export continues. |
 | Delete fails after export | Logged; the export stands and is not retried. |
 | Late conference leg (arrives in a later poll) | Gets `conference_id` only if metadata reports >2 participants; otherwise exported as a call (open question 5). |
 
