@@ -22,7 +22,8 @@ merges them into one group under the longest; the others are superseded the
 same way. Outputs are discarded before the database changes, so a file held
 open only delays the change to the next poll.
 
-A FAILED primary never keeps its conference: the next-longest copy is elected.
+A FAILED primary never keeps its conference: the next-longest copy is elected,
+or it is handed to the winner of a merge that bridges it.
 """
 
 from __future__ import annotations
@@ -184,19 +185,21 @@ def _merge(
     store: JobStore,
     audit: AuditLog,
     copy: Job,
-    overlapping: list[Job],
+    live: list[Job],
+    failed: list[Job],
     slack: timedelta,
     changes: _Changes,
 ) -> Job | None:
-    """Settle a copy into the live primaries it overlaps, merging them into one group. Returns the winner.
+    """Settle a copy into the primaries it overlaps, merging them into one group. Returns the winner.
 
-    The longest primary keeps the group unless the copy `_replaces` it; every
-    other overlapping primary is superseded. Losers' outputs go first, so a
-    locked file leaves the database untouched (None) and the next poll retries.
+    The longest live primary keeps the group unless the copy `_replaces` it;
+    every other overlapping primary, failed ones included, is superseded.
+    Losers' outputs go first, so a locked file leaves the database untouched
+    (None) and the next poll retries.
     """
-    best = min(overlapping, key=_rank)
+    best = min(live, key=_rank)
     winner = copy if _replaces(copy, best, slack) else best
-    losers = [p for p in overlapping if p.job_key != winner.job_key]
+    losers = [p for p in live if p.job_key != winner.job_key] + failed
     if not _discard_all(cfg, audit, losers, winner.job_key):
         return None
     if winner is copy:
@@ -204,6 +207,28 @@ def _merge(
     elif not _attach(store, copy, best, losers, changes):
         return None
     return store.get(winner.job_key)
+
+
+def _reelect(
+    cfg: Config, store: JobStore, audit: AuditLog, failed: list[Job], copy: Job | None, changes: _Changes
+) -> Job | None:
+    """Hand failed primaries to the longest of their waiting-or-grouped copies. Returns the new primary.
+
+    None when there is no candidate yet, or a locked output delays it to the next poll.
+    """
+    candidates = [m for f in failed for m in store.members(f.job_key) if m.status == GROUPED]
+    if copy is not None:
+        candidates.append(copy)
+    if not candidates:
+        return None
+    chosen = min(candidates, key=_rank)
+    if not _discard_all(cfg, audit, failed, chosen.job_key):
+        return None
+    _promote(store, chosen, failed, changes)
+    if copy is not None and copy.job_key != chosen.job_key:
+        store.group_into(copy.job_key, chosen.job_key)
+        changes.attached.append(copy.job_key)
+    return store.get(chosen.job_key)
 
 
 def _settle_conference(
@@ -217,25 +242,21 @@ def _settle_conference(
     for copy in sorted((j for j in jobs if j.status == WAITING), key=_rank):
         overlapping = [p for p in primaries if _overlaps(copy, _span(p, store), slack)]
         live = [p for p in overlapping if p.status != FAILED]
+        failed = [p for p in overlapping if p.status == FAILED]
         if live:
-            winner = _merge(cfg, store, audit, copy, live, slack, changes)
-            if winner is not None:
-                primaries = [p for p in primaries if p not in live] + [winner]
-        elif overlapping:
-            # Never attach to a failed primary: join as a candidate for the re-election below.
-            store.group_into(copy.job_key, overlapping[0].job_key)
+            winner = _merge(cfg, store, audit, copy, live, failed, slack, changes)
+        elif failed:
+            # A failed primary never keeps its conference: elect among its copies and this one.
+            winner = _reelect(cfg, store, audit, failed, copy, changes)
         else:
             unmatched.append(copy)
+            continue
+        if winner is not None:
+            primaries = [p for p in primaries if p not in overlapping] + [winner]
 
     for primary in primaries:
-        if primary.status != FAILED:
-            continue
-        candidates = [m for m in store.members(primary.job_key) if m.status == GROUPED]
-        if not candidates:
-            continue
-        chosen = min(candidates, key=_rank)
-        if _discard_outputs(cfg, audit, primary, chosen.job_key):
-            _promote(store, chosen, [primary], changes)
+        if primary.status == FAILED:
+            _reelect(cfg, store, audit, [primary], None, changes)
 
     for cluster in _clusters(unmatched, slack):
         arrivals = [datetime.fromisoformat(j.created_at) for j in cluster]

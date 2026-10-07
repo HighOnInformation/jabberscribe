@@ -403,3 +403,165 @@ def test_done_primary_absorbs_a_bridged_group_without_reprocessing(cfg, store, a
     assert not (store.get(second).out_dir / RESULT_FILE).exists()
     assert audit.entries(second)[-1].action == SUPERSEDED
     assert _owners(store, first) == ["1042", "2210", "3000"]
+
+
+def _failed_joiner(cfg, store, audit, make_wav, make_sidecar, *, with_member: bool) -> tuple[str, str, str | None]:
+    """A leaver processed alone, then a late joiner released as its own primary that failed."""
+    leaver = _drop(
+        cfg, store, audit, make_wav, make_sidecar, "a", "1042", started_at="2026-10-07T14:00:00+03:00", duration_sec=480
+    )
+    _release(cfg, store, audit, leaver)
+    _finish(store, leaver)
+    joiner = _drop(
+        cfg, store, audit, make_wav, make_sidecar, "j", "4000", started_at="2026-10-07T14:30:00+03:00", duration_sec=600
+    )
+    member = None
+    if with_member:
+        member = _drop(
+            cfg,
+            store,
+            audit,
+            make_wav,
+            make_sidecar,
+            "k",
+            "5000",
+            started_at="2026-10-07T14:31:00+03:00",
+            duration_sec=500,
+        )
+    _release(cfg, store, audit, *[k for k in (joiner, member) if k])
+    store.set_status(joiner, FAILED)
+    return leaver, joiner, member
+
+
+def test_bridging_copy_takes_in_a_failed_primary_without_members(cfg, store, audit, make_wav, make_sidecar) -> None:
+    leaver, joiner, _ = _failed_joiner(cfg, store, audit, make_wav, make_sidecar, with_member=False)
+    host = _drop(
+        cfg,
+        store,
+        audit,
+        make_wav,
+        make_sidecar,
+        "b",
+        "2210",
+        started_at="2026-10-07T14:00:00+03:00",
+        duration_sec=3600,
+    )
+
+    result = _settle(cfg, store, audit)
+
+    assert result.released == (host,)
+    assert sorted(result.superseded) == sorted([leaver, joiner])
+    assert (store.get(joiner).status, store.get(joiner).grouped_into) == (FAILED, host)
+    assert [o.extension for o in owners_for(store.get(host), store)] == ["2210", "1042", "4000"]
+
+
+def test_bridging_copy_takes_in_a_failed_primary_and_its_members(cfg, store, audit, make_wav, make_sidecar) -> None:
+    leaver, joiner, member = _failed_joiner(cfg, store, audit, make_wav, make_sidecar, with_member=True)
+    host = _drop(
+        cfg,
+        store,
+        audit,
+        make_wav,
+        make_sidecar,
+        "b",
+        "2210",
+        started_at="2026-10-07T14:00:00+03:00",
+        duration_sec=3600,
+    )
+
+    result = _settle(cfg, store, audit)
+
+    assert result.released == (host,)
+    assert (store.get(joiner).status, store.get(joiner).grouped_into) == (FAILED, host)
+    assert (store.get(member).status, store.get(member).grouped_into) == (GROUPED, host)
+    assert {o.extension for o in owners_for(store.get(host), store)} == {"2210", "1042", "4000", "5000"}
+
+
+def test_copy_bridging_only_failed_primaries_merges_them(cfg, store, audit, make_wav, make_sidecar) -> None:
+    leaver, joiner, member = _failed_joiner(cfg, store, audit, make_wav, make_sidecar, with_member=True)
+    store.set_status(leaver, FAILED)
+    bridge = _drop(
+        cfg,
+        store,
+        audit,
+        make_wav,
+        make_sidecar,
+        "b",
+        "2210",
+        started_at="2026-10-07T14:05:00+03:00",
+        duration_sec=1800,
+    )
+
+    result = _settle(cfg, store, audit)
+
+    assert result.released == (bridge,)
+    assert sorted(result.superseded) == sorted([leaver, joiner])
+    assert store.get(bridge).status == QUEUED
+    assert (store.get(leaver).status, store.get(leaver).grouped_into) == (FAILED, bridge)
+    assert (store.get(joiner).status, store.get(joiner).grouped_into) == (FAILED, bridge)
+    assert store.get(member).grouped_into == bridge
+    assert {o.extension for o in owners_for(store.get(bridge), store)} == {"2210", "1042", "4000", "5000"}
+
+
+def test_failed_reelection_waits_while_an_output_is_locked(cfg, store, audit, make_wav, make_sidecar, monkeypatch):
+    longest = _drop(cfg, store, audit, make_wav, make_sidecar, "a", "1042", duration_sec=300)
+    second = _drop(cfg, store, audit, make_wav, make_sidecar, "b", "2210", duration_sec=200)
+    _release(cfg, store, audit, longest, second)
+    (store.get(longest).out_dir / TRANSCRIPT_FILE).write_text("partial", encoding="utf-8")
+    store.set_status(longest, FAILED)
+    _lock(monkeypatch, TRANSCRIPT_FILE)
+
+    assert _settle(cfg, store, audit) == SettleResult()
+    assert (store.get(longest).status, store.get(longest).grouped_into) == (FAILED, None)
+    assert store.get(second).grouped_into == longest
+
+    monkeypatch.undo()
+    assert _settle(cfg, store, audit).released == (second,)
+    assert not (store.get(longest).out_dir / TRANSCRIPT_FILE).exists()
+
+
+def test_merge_retries_after_owner_update_fails_without_auditing_twice(
+    cfg, store, audit, make_wav, make_sidecar, monkeypatch
+) -> None:
+    first = _drop(
+        cfg,
+        store,
+        audit,
+        make_wav,
+        make_sidecar,
+        "a",
+        "1042",
+        started_at="2026-10-07T14:00:00+03:00",
+        duration_sec=1800,
+    )
+    _release(cfg, store, audit, first)
+    _finish(store, first, owners=[{"extension": "1042"}])
+    second = _drop(
+        cfg, store, audit, make_wav, make_sidecar, "b", "2210", started_at="2026-10-07T14:40:00+03:00", duration_sec=600
+    )
+    _release(cfg, store, audit, second)
+    _finish(store, second)
+    bridge = _drop(
+        cfg,
+        store,
+        audit,
+        make_wav,
+        make_sidecar,
+        "c",
+        "3000",
+        started_at="2026-10-07T14:20:00+03:00",
+        duration_sec=1500,
+    )
+
+    def locked(out_dir, owners):
+        raise PermissionError("result.json is open in Explorer")
+
+    monkeypatch.setattr("jabberscribe.group.update_owners", locked)
+    assert _settle(cfg, store, audit) == SettleResult()
+    assert store.get(bridge).status == WAITING
+    assert (store.get(second).status, store.get(second).grouped_into) == (DONE, None)
+
+    monkeypatch.undo()
+    assert _settle(cfg, store, audit) == SettleResult(attached=(bridge,), superseded=(second,))
+    assert _owners(store, first) == ["1042", "2210", "3000"]
+    assert [e.action for e in audit.entries(second)].count(SUPERSEDED) == 1
