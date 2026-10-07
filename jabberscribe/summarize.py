@@ -23,6 +23,7 @@ the chunks' items, each keeping its own source_ts.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -39,8 +40,8 @@ log = logging.getLogger(__name__)
 ATTEMPTS = 2
 #: Explicit, so the server default cannot cut the JSON answer off mid-object.
 MAX_TOKENS = 2048
-#: How much of an unusable answer goes into the log.
-LOG_CHARS = 300
+#: How many hex digits of an unusable answer's SHA-256 go into the log. Never its text: that is call content.
+LOG_HASH_CHARS = 12
 #: The chat route rejected this input (too long, unprocessable): degrade, do not fail the job.
 UNPROCESSABLE_STATUSES = (400, 413, 422)
 
@@ -219,12 +220,15 @@ class LiteLLMSummarizer:
                 content = self._complete(f"{instructions}\n\n{body}")
                 return parse(content)
             except (ValueError, KeyError, IndexError, TypeError) as exc:
+                # Error type, length and hash only: messages such as pydantic's quote the input.
+                raw = (content or "").encode("utf-8")
                 log.warning(
-                    "summary attempt %d/%d returned unusable output: %s; raw: %r",
+                    "summary attempt %d/%d returned unusable output (%s): %d chars, sha256 %s",
                     attempt,
                     ATTEMPTS,
-                    exc,
-                    (content or "")[:LOG_CHARS],
+                    type(exc).__name__,
+                    len(content or ""),
+                    hashlib.sha256(raw).hexdigest()[:LOG_HASH_CHARS],
                 )
         raise SummaryUnavailable(f"model output stayed unusable after {ATTEMPTS} attempts")
 
@@ -250,5 +254,5 @@ class LiteLLMSummarizer:
         content = response.json()["choices"][0]["message"]["content"]
         if not isinstance(content, str) or not content.strip():
             # A refusal or an empty completion: unusable output, not a crash.
-            raise ValueError(f"model returned no text content: {content!r}")
+            raise ValueError(f"model returned no text content ({type(content).__name__})")
         return content

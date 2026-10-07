@@ -114,7 +114,8 @@ class LiteLLMTranscriber:
                 if not text:
                     continue
                 if is_hallucination(raw, text, self._prompt):
-                    log.info("dropping likely hallucinated segment at %.1fs: %r", float(raw["start"]), text[:80])
+                    # Never the text: it is call content, and logs have no retention.
+                    log.info("dropping likely hallucinated segment at %.1fs (%d chars)", float(raw["start"]), len(text))
                     continue
                 segments.append(Segment(float(raw["start"]), float(raw["end"]), text))
         except (KeyError, TypeError, ValueError) as exc:

@@ -1,4 +1,6 @@
+import hashlib
 import json
+import logging
 
 import httpx
 import pytest
@@ -95,7 +97,29 @@ def test_gives_up_after_two_unusable_answers_and_logs_them(caplog) -> None:
     with pytest.raises(SummaryUnavailable, match="unusable"):
         _summarizer(server).summarize(SEGMENTS)
     assert len(server.requests) == 2
-    assert "still nope" in caplog.text
+    assert hashlib.sha256(b"still nope").hexdigest()[:12] in caplog.text
+
+
+def test_unusable_answers_never_put_call_content_in_the_log(caplog) -> None:
+    """Model output is meeting content; logs have no retention, so they get its length and hash only."""
+    leaky = json.dumps({"summary": "", "action_items": [{"task": "סוד מסחרי", "source_ts": "bad"}]}, ensure_ascii=False)
+    server = Server("הסוד המסחרי של דנה", leaky)
+
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(SummaryUnavailable):
+        _summarizer(server).summarize(SEGMENTS)
+
+    assert "סוד" not in caplog.text
+    assert "שלום" not in caplog.text
+    assert f"{len('הסוד המסחרי של דנה')} chars" in caplog.text
+
+
+def test_non_text_content_is_not_echoed(caplog) -> None:
+    server = Server([{"type": "text", "text": "סוד"}], [{"type": "text", "text": "סוד"}])
+
+    with pytest.raises(SummaryUnavailable):
+        _summarizer(server).summarize(SEGMENTS)
+    assert "סוד" not in caplog.text
 
 
 def test_null_content_is_unusable_output_not_a_crash() -> None:

@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 import httpx
@@ -140,3 +141,13 @@ def test_load_vocabulary(tmp_path: Path) -> None:
     assert load_vocabulary(path) == "ג'אבר, שלוחה"
     assert load_vocabulary(None) is None
     assert load_vocabulary(tmp_path / "missing.txt") is None
+
+
+def test_dropped_segments_are_logged_without_their_text(tmp_path: Path, caplog) -> None:
+    bad = {"start": 0.0, "end": 5.0, "text": "תודה רבה תודה רבה", "compression_ratio": 2.6}
+    caplog.set_level(logging.DEBUG)
+
+    _transcriber(lambda r: _segments_response(bad)).transcribe(_audio(tmp_path))
+
+    assert "dropping" in caplog.text
+    assert "תודה" not in caplog.text
