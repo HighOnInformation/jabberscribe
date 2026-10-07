@@ -126,8 +126,9 @@ def _sweep(
 def purge(cfg: Config, store: JobStore, audit: AuditLog, now: datetime) -> PurgeResult:
     """Delete aged audio and text, sweep leftovers, scrub old metadata. Every deletion is audited.
 
-    A job still in the pipeline (QUEUED, RUNNING, WAITING) keeps its work dir and STT copy. Its audio is
-    the one exception: retention wins, and the job is failed because it can no longer be processed.
+    A job still in the pipeline (QUEUED, RUNNING, WAITING) or on legal hold keeps its work dir and STT copy.
+    An active job's audio is the one exception: retention wins, and the job is failed because it can no
+    longer be processed.
     """
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
@@ -182,7 +183,10 @@ def purge(cfg: Config, store: JobStore, audit: AuditLog, now: datetime) -> Purge
             errors.append(f"{job.job_key}: database error: {exc}")
 
     stt_copies = [
-        p for d in cfg.paths.work_dir.glob("*") if d.name not in active_keys for p in d.glob(STT_GLOB)
+        p
+        for d in cfg.paths.work_dir.glob("*")
+        if d.name not in active_keys and not store.is_held(d.name)
+        for p in d.glob(STT_GLOB)
     ]
     swept, sweep_errors = _sweep(stt_copies, STT_LEFTOVER_DAYS, now, PURGED_STT_AUDIO, audit, lambda p: p.parent.name)
     errors += sweep_errors

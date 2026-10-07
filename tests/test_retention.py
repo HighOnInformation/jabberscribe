@@ -289,3 +289,15 @@ def test_audit_failure_is_reported_and_purge_continues(cfg, store, audit, make_w
 def test_naive_now_is_refused(cfg, store, audit) -> None:
     with pytest.raises(ValueError, match="timezone"):
         purge(cfg, store, audit, now=datetime(2027, 1, 1))
+
+
+def test_a_held_done_jobs_stt_leftover_survives_the_sweep(cfg, store, audit, make_wav, make_sidecar) -> None:
+    now = STARTED + timedelta(days=10)
+    job, work = _setup(cfg, store, audit, make_wav, make_sidecar)
+    stt = _touch(work / "stt.ogg", now - timedelta(days=2))
+    store.hold(job.job_key, "litigation")
+
+    result = purge(cfg, store, audit, now=now)
+
+    assert stt.exists()
+    assert result.swept == ()
