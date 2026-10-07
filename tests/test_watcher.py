@@ -1,3 +1,5 @@
+import pytest
+
 from jabberscribe.jobs import QUEUED, WAITING, JobStore
 from jabberscribe.watcher import find_ready_pairs, scan_once
 
@@ -151,3 +153,38 @@ def test_scan_honours_min_age_override(cfg, make_wav, make_sidecar) -> None:
 
     assert scan_once(cfg, store, min_age_seconds=3600).enqueued == ()
     assert scan_once(cfg, store, min_age_seconds=0).enqueued == ("ovr_1042",)
+
+
+def test_failed_copy_keeps_the_recording_for_retry(cfg, make_wav, make_sidecar, monkeypatch) -> None:
+    make_wav(cfg.paths.inbox / "a.wav")
+    make_sidecar(cfg.paths.inbox / "a.json", call_id="abc")
+    store = _store(cfg)
+    monkeypatch.setattr("jabberscribe.watcher.shutil.copyfile", _raise_disk_full)
+
+    with pytest.raises(OSError):
+        scan_once(cfg, store)
+
+    assert store.list_all() == []
+    assert (cfg.paths.inbox / "a.wav").exists()
+    assert (cfg.paths.inbox / "a.json").exists()
+
+    monkeypatch.undo()
+    result = scan_once(cfg, store)
+
+    assert result.enqueued == ("abc_1042",)
+    assert store.get("abc_1042").audio_path.is_file()
+    assert not (cfg.paths.inbox / "a.wav").exists()
+    assert not (cfg.paths.inbox / "a.json").exists()
+
+
+def test_no_partial_recording_is_left(cfg, make_wav, make_sidecar) -> None:
+    make_wav(cfg.paths.inbox / "a.wav")
+    make_sidecar(cfg.paths.inbox / "a.json")
+
+    scan_once(cfg, _store(cfg))
+
+    assert list(cfg.paths.out_root.rglob("*.part")) == []
+
+
+def _raise_disk_full(*args, **kwargs):
+    raise OSError("disk full")

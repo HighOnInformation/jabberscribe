@@ -105,7 +105,22 @@ def scan_once(cfg: Config, store: JobStore, min_age_seconds: int | None = None) 
 
         out_dir = out_dir_for(cfg.paths.out_root, sidecar)
         stored_audio = out_dir / f"recording{audio.suffix}"
-        created = store.create(
+        if store.get(sidecar.job_key) is not None:
+            # Already known. Drop the duplicate rather than reprocess it.
+            log.info("duplicate %s, discarding inbox copy", sidecar.job_key)
+            audio.unlink(missing_ok=True)
+            sidecar_path.unlink(missing_ok=True)
+            skipped.append(sidecar.job_key)
+            continue
+
+        # Every step is safe to repeat: a crash before create() leaves the inbox
+        # pair in place and the next scan redoes the copy. The recording is never
+        # deleted from the inbox before a job row references a complete copy.
+        out_dir.mkdir(parents=True, exist_ok=True)
+        part = stored_audio.with_suffix(stored_audio.suffix + ".part")
+        shutil.copyfile(audio, part)
+        part.replace(stored_audio)
+        store.create(
             job_key=sidecar.job_key,
             call_id=sidecar.call_id,
             conference_id=sidecar.conference_id,
@@ -115,16 +130,7 @@ def scan_once(cfg: Config, store: JobStore, min_age_seconds: int | None = None) 
             started_at=sidecar.started_at,
             duration_sec=sidecar.duration_sec,
         )
-        if not created:
-            # Already known. Drop the duplicate rather than reprocess it.
-            log.info("duplicate %s, discarding inbox copy", sidecar.job_key)
-            audio.unlink(missing_ok=True)
-            sidecar_path.unlink(missing_ok=True)
-            skipped.append(sidecar.job_key)
-            continue
-
-        out_dir.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(audio), str(stored_audio))
+        audio.unlink(missing_ok=True)
         sidecar_path.unlink(missing_ok=True)
         enqueued.append(sidecar.job_key)
         log.info("enqueued %s", sidecar.job_key)
