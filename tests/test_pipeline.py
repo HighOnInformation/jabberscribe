@@ -1,0 +1,234 @@
+import json
+import shutil
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+from jabberscribe.audio import STT_FILENAME
+from jabberscribe.jobs import DONE, FAILED, QUEUED
+from jabberscribe.llm import TransientError
+from jabberscribe.output import ACTIONS_FILE, RESULT_FILE, SUMMARY_FILE, TRANSCRIPT_FILE
+from jabberscribe.pipeline import MAX_ATTEMPTS, backoff, run_job, run_once
+from jabberscribe.stt import Segment, SttError
+from jabberscribe.summarize import ActionItem, Summary
+from jabberscribe.watcher import scan_once
+
+pytestmark = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+
+SUMMARY = Summary("סיכום.", (ActionItem("לשלוח את הדוח", "דנה", None, "00:00:01"),))
+T0 = datetime(2026, 10, 7, 12, 0, tzinfo=UTC)
+
+
+class FakeTranscriber:
+    def __init__(self) -> None:
+        self.calls: list[Path] = []
+
+    def transcribe(self, audio: Path) -> list[Segment]:
+        self.calls.append(audio)
+        return [Segment(0.0, 1.5, "אה, שלום"), Segment(1.5, 3.0, "נדבר מחר")]
+
+
+class FailingTranscriber:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def transcribe(self, audio: Path) -> list[Segment]:
+        raise self.error
+
+
+class FakeSummarizer:
+    def __init__(self, result: Summary | None = SUMMARY) -> None:
+        self.result = result
+        self.seen: list[Segment] | None = None
+
+    def summarize(self, segments: list[Segment]) -> Summary | None:
+        self.seen = segments
+        return self.result
+
+
+class ExplodingSummarizer:
+    def summarize(self, segments: list[Segment]) -> Summary | None:
+        raise RuntimeError("summarizer bug")
+
+
+def _enqueue(cfg, store, audit, make_wav, make_sidecar, *, call_id="abc", extension="1042", **extra) -> str:
+    make_wav(cfg.paths.inbox / f"{call_id}{extension}.wav", channels=2)
+    make_sidecar(
+        cfg.paths.inbox / f"{call_id}{extension}.json", call_id=call_id, extension=extension, tracks="dual", **extra
+    )
+    scan_once(cfg, store, audit, min_age_seconds=0)
+    return f"{call_id}_{extension}"
+
+
+def _result(job) -> dict:
+    return json.loads((job.out_dir / RESULT_FILE).read_text(encoding="utf-8"))
+
+
+def test_end_to_end_writes_outputs_and_marks_done(cfg, store, audit, make_wav, make_sidecar) -> None:
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+
+    assert run_once(cfg, store, FakeTranscriber(), FakeSummarizer()) == 1
+
+    job = store.get(key)
+    assert job.status == DONE
+    result = _result(job)
+    assert result["transcript"][0]["text"] == "אה, שלום"
+    assert result["summary"] == "סיכום."
+    assert result["models"] == {"stt": "whisper-he", "summary": "gemma-3"}
+    for name in ("recording.wav", TRANSCRIPT_FILE, SUMMARY_FILE, ACTIONS_FILE):
+        assert (job.out_dir / name).is_file()
+
+
+def test_result_records_stage_timings_and_latency(cfg, store, audit, make_wav, make_sidecar) -> None:
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+
+    run_once(cfg, store, FakeTranscriber(), FakeSummarizer())
+
+    timings = _result(store.get(key))["timings"]
+    assert set(timings) == {"audio_sec", "stt_sec", "summarize_sec", "hangup_to_output_sec"}
+    assert timings["hangup_to_output_sec"] > 0
+
+
+def test_summarizer_gets_the_transcript(cfg, store, audit, make_wav, make_sidecar) -> None:
+    _enqueue(cfg, store, audit, make_wav, make_sidecar)
+    summarizer = FakeSummarizer()
+
+    run_once(cfg, store, FakeTranscriber(), summarizer)
+
+    assert [s.text for s in summarizer.seen] == ["אה, שלום", "נדבר מחר"]
+
+
+def test_stt_audio_is_removed_after_transcription(cfg, store, audit, make_wav, make_sidecar) -> None:
+    """The Opus copy is the voice too; keeping it would dodge audio retention."""
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+
+    run_once(cfg, store, FakeTranscriber(), FakeSummarizer())
+
+    assert not (cfg.paths.work_dir / key / STT_FILENAME).exists()
+
+
+def test_unavailable_summary_still_completes(cfg, store, audit, make_wav, make_sidecar) -> None:
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+
+    run_once(cfg, store, FakeTranscriber(), FakeSummarizer(None))
+
+    job = store.get(key)
+    assert job.status == DONE
+    assert _result(job)["summary_available"] is False
+
+
+def test_resume_after_crash_does_not_retranscribe(cfg, store, audit, make_wav, make_sidecar) -> None:
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+
+    run_once(cfg, store, FakeTranscriber(), ExplodingSummarizer(), now=T0)
+    crashed = store.get(key)
+    assert (crashed.status, crashed.stage, crashed.attempts) == (QUEUED, "stt", 1)
+    assert "summarize: summarizer bug" in crashed.last_error
+
+    transcriber = FakeTranscriber()
+    run_once(cfg, store, transcriber, FakeSummarizer(), now=T0 + timedelta(minutes=1))
+
+    assert store.get(key).status == DONE
+    assert transcriber.calls == []
+
+
+def test_failed_job_waits_for_its_backoff(cfg, store, audit, make_wav, make_sidecar) -> None:
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+    run_once(cfg, store, FailingTranscriber(SttError("bad audio")), FakeSummarizer(), now=T0)
+
+    assert store.get(key).next_attempt_at == "2026-10-07T12:00:30+00:00"
+    assert run_once(cfg, store, FakeTranscriber(), FakeSummarizer(), now=T0 + timedelta(seconds=29)) == 0
+    assert run_once(cfg, store, FakeTranscriber(), FakeSummarizer(), now=T0 + timedelta(seconds=30)) == 1
+
+
+def test_permanent_failure_gives_up_and_deletes_the_stt_copy(cfg, store, audit, make_wav, make_sidecar) -> None:
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+    transcriber = FailingTranscriber(SttError("HTTP 413 too large"))
+
+    for hour in range(MAX_ATTEMPTS):
+        assert store.get(key).status == QUEUED
+        run_once(cfg, store, transcriber, FakeSummarizer(), now=T0 + timedelta(hours=hour))
+        if hour == 0:
+            assert (cfg.paths.work_dir / key / STT_FILENAME).is_file()
+
+    job = store.get(key)
+    assert job.status == FAILED
+    assert "413" in job.last_error
+    assert not (cfg.paths.work_dir / key / STT_FILENAME).exists()
+
+
+def test_transient_failure_never_fails_the_job(cfg, store, audit, make_wav, make_sidecar) -> None:
+    """An hour-long LiteLLM outage delays calls; it must not lose them."""
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+    transcriber = FailingTranscriber(TransientError("HTTP 503"))
+
+    for hour in range(10):
+        run_once(cfg, store, transcriber, FakeSummarizer(), now=T0 + timedelta(hours=hour))
+
+    job = store.get(key)
+    assert (job.status, job.attempts) == (QUEUED, 10)
+    run_once(cfg, store, FakeTranscriber(), FakeSummarizer(), now=T0 + timedelta(hours=10))
+    assert store.get(key).status == DONE
+
+
+def test_a_failing_job_does_not_block_the_queue(cfg, store, audit, make_wav, make_sidecar) -> None:
+    first = _enqueue(cfg, store, audit, make_wav, make_sidecar, call_id="aaa")
+    second = _enqueue(cfg, store, audit, make_wav, make_sidecar, call_id="bbb")
+
+    class FailFirst(FakeTranscriber):
+        def transcribe(self, audio: Path) -> list[Segment]:
+            if first in str(audio):
+                raise SttError("poisoned")
+            return super().transcribe(audio)
+
+    assert run_once(cfg, store, FailFirst(), FakeSummarizer(), now=T0) == 2
+    assert store.get(first).status == QUEUED
+    assert store.get(second).status == DONE
+
+
+def test_backoff_doubles_up_to_thirty_minutes() -> None:
+    assert [backoff(n).total_seconds() for n in (1, 2, 3, 6, 7, 20)] == [30, 60, 120, 960, 1800, 1800]
+
+
+def test_unreadable_sidecar_counts_as_an_attempt(cfg, store, audit, make_wav, make_sidecar) -> None:
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+    store.scrub_sidecar(key)
+
+    for hour in range(MAX_ATTEMPTS):
+        run_once(cfg, store, FakeTranscriber(), FakeSummarizer(), now=T0 + timedelta(hours=hour))
+
+    assert store.get(key).status == FAILED
+
+
+def test_grouped_copies_are_listed_as_owners(cfg, store, audit, make_wav, make_sidecar) -> None:
+    primary = _enqueue(
+        cfg, store, audit, make_wav, make_sidecar, call_id="leg1", extension="1042", conference_id="conf-1"
+    )
+    member = _enqueue(
+        cfg, store, audit, make_wav, make_sidecar, call_id="leg2", extension="3000", conference_id="conf-1"
+    )
+    store.set_status(primary, QUEUED)
+    store.group_into(member, primary)
+
+    run_once(cfg, store, FakeTranscriber(), FakeSummarizer())
+
+    assert [o["extension"] for o in _result(store.get(primary))["owners"]] == ["1042", "3000"]
+
+
+def test_run_job_processes_only_that_job_even_if_not_due(cfg, store, audit, make_wav, make_sidecar) -> None:
+    mine = _enqueue(cfg, store, audit, make_wav, make_sidecar, call_id="mine")
+    other = _enqueue(cfg, store, audit, make_wav, make_sidecar, call_id="other")
+    store.schedule_retry(mine, datetime.now(UTC) + timedelta(hours=1))
+
+    assert run_job(mine, cfg, store, FakeTranscriber(), FakeSummarizer()) is True
+
+    assert store.get(mine).status == DONE
+    assert store.get(other).status == QUEUED
+
+
+def test_run_job_refuses_a_finished_job(cfg, store, audit, make_wav, make_sidecar) -> None:
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+    store.set_status(key, DONE)
+
+    assert run_job(key, cfg, store, FakeTranscriber(), FakeSummarizer()) is False
