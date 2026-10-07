@@ -159,6 +159,7 @@ def process_job(
                     # A file locked or a share unavailable on the output side is
                     # not bad data; it clears on its own.
                     raise TransientError(str(exc)) from exc
+                store.record_output(job.job_key, timings["hangup_to_output_sec"])
             if stage != "output":
                 timings[f"{stage}_sec"] = round(time.monotonic() - began, 1)
                 write_atomic(timings_path, json.dumps(timings))

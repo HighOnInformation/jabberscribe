@@ -37,7 +37,7 @@ STAGE_ORDER: tuple[str, ...] = ("audio", "stt", "summarize", "output")
 COPY_STAGES: tuple[str, ...] = (QUEUED, "audio")
 
 #: Stored in PRAGMA user_version. Versions listed in MIGRATIONS are upgraded in place; any other is refused.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 #: Columns that upgrade a database from the keyed version to the next one: (name, type and default).
 #: A column that is already there is skipped, so a pre-release database that has it upgrades cleanly.
@@ -45,6 +45,10 @@ MIGRATIONS: dict[int, tuple[tuple[str, str], ...]] = {
     2: (
         ("legal_hold", "INTEGER NOT NULL DEFAULT 0"),
         ("hold_reason", "TEXT"),
+    ),
+    3: (
+        ("output_at", "TEXT"),
+        ("latency_sec", "REAL"),
     ),
 }
 
@@ -70,6 +74,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   next_attempt_at TEXT,
   legal_hold      INTEGER NOT NULL DEFAULT 0,
   hold_reason     TEXT,
+  output_at       TEXT,
+  latency_sec     REAL,
   created_at      TEXT NOT NULL,
   updated_at      TEXT NOT NULL
 );
@@ -123,6 +129,9 @@ class Job:
     transient_failures: int
     legal_hold: bool = False
     hold_reason: str | None = None
+    #: When the outputs were last written, and how long after hang-up (for `status`).
+    output_at: str | None = None
+    latency_sec: float | None = None
 
 
 def _row_to_job(row: sqlite3.Row) -> Job:
@@ -145,6 +154,8 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         transient_failures=row["transient_failures"],
         legal_hold=bool(row["legal_hold"]),
         hold_reason=row["hold_reason"],
+        output_at=row["output_at"],
+        latency_sec=row["latency_sec"],
     )
 
 
@@ -424,6 +435,33 @@ class JobStore:
     def held_jobs(self) -> list[Job]:
         rows = self._conn.execute("SELECT * FROM jobs WHERE legal_hold = 1 ORDER BY created_at, rowid").fetchall()
         return [_row_to_job(r) for r in rows]
+
+    def record_output(self, job_key: str, latency_sec: float) -> None:
+        """Remember that the outputs were written now, `latency_sec` after the call ended."""
+        now = utcnow()
+        self._conn.execute(
+            "UPDATE jobs SET output_at = ?, latency_sec = ?, updated_at = ? WHERE job_key = ?",
+            (now, latency_sec, now, job_key),
+        )
+
+    def latencies_since(self, since: datetime) -> list[float]:
+        """Hang-up-to-output latencies of the outputs written at or after `since`, ascending."""
+        rows = self._conn.execute(
+            "SELECT latency_sec FROM jobs WHERE output_at >= ? AND latency_sec IS NOT NULL ORDER BY latency_sec",
+            (iso(since),),
+        ).fetchall()
+        return [float(r["latency_sec"]) for r in rows]
+
+    def status_counts(self) -> dict[str, int]:
+        rows = self._conn.execute("SELECT status, COUNT(*) AS n FROM jobs GROUP BY status").fetchall()
+        return {r["status"]: int(r["n"]) for r in rows}
+
+    def oldest_pending_created_at(self) -> str | None:
+        """Arrival time of the oldest job still in the pipeline (ACTIVE: QUEUED, RUNNING or WAITING)."""
+        row = self._conn.execute(
+            "SELECT MIN(created_at) AS oldest FROM jobs WHERE status IN (?, ?, ?)", ACTIVE
+        ).fetchone()
+        return row["oldest"]
 
     def list_all(self) -> list[Job]:
         rows = self._conn.execute("SELECT * FROM jobs ORDER BY created_at, rowid").fetchall()

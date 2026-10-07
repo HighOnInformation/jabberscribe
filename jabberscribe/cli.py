@@ -30,6 +30,7 @@ import httpx
 from jabberscribe.audit import LEGAL_HOLD_RELEASED, LEGAL_HOLD_SET, AuditLog
 from jabberscribe.config import Config, ConfigError, load_config
 from jabberscribe.group import requeue_failed, settle
+from jabberscribe.health import heartbeat_path, latency_summary, read_heartbeat, write_heartbeat
 from jabberscribe.jobs import DONE, FAILED, GROUPED, QUEUED, RUNNING, WAITING, JobStore, SchemaError
 from jabberscribe.llm import TransientError, make_client, post
 from jabberscribe.lock import LockError, instance_lock
@@ -262,6 +263,7 @@ def _report_purge(cfg: Config, store: JobStore, audit: AuditLog) -> int:
 def _serve(cfg: Config, store: JobStore, audit: AuditLog, once: bool) -> int:
     transcriber, summarizer = _workers(cfg, make_client(cfg.litellm))
     last_purge: date | None = None
+    polls = 0
     while True:
         ok = True
         phases = (
@@ -287,9 +289,19 @@ def _serve(cfg: Config, store: JobStore, audit: AuditLog, once: bool) -> int:
             except Exception:
                 log.exception("purge failed; next attempt tomorrow")
                 ok = False
+        polls += 1
+        _beat(cfg, store, polls, ok)
         if once:
             return 0 if ok else 1
         time.sleep(cfg.watcher.poll_seconds)
+
+
+def _beat(cfg: Config, store: JobStore, polls: int, ok: bool) -> None:
+    try:
+        write_heartbeat(heartbeat_path(cfg.paths.db_path), store, _utcnow(), polls=polls, last_poll_ok=ok)
+    except Exception:
+        # A monitor will notice the stale heartbeat; the service itself carries on.
+        log.exception("cannot write the heartbeat")
 
 
 def _retry(store: JobStore, job_key: str | None, all_failed: bool) -> int:
@@ -335,8 +347,17 @@ def _unhold(store: JobStore, audit: AuditLog, job_key: str, reason: str) -> int:
     return 0
 
 
-def _status(store: JobStore) -> int:
-    """Counts by status, the oldest waiting and queued job, and every retrying or failed job.
+def _heartbeat_line(cfg: Config, now: datetime) -> str:
+    beat = read_heartbeat(heartbeat_path(cfg.paths.db_path))
+    if beat is None:
+        return "heartbeat: none (is `jabberscribe run` running?)"
+    age = (now - datetime.fromisoformat(beat["last_poll_at"])).total_seconds()
+    state = "ok" if beat.get("last_poll_ok") else "FAILED"
+    return f"heartbeat: {age:.0f} s ago, poll {beat.get('polls')}, last poll {state}"
+
+
+def _status(cfg: Config, store: JobStore) -> int:
+    """Counts by status, the oldest waiting and queued job, latency, heartbeat, and every retrying or failed job.
 
     Exits 1 while any FAILED job is not superseded by a DONE primary, so a scheduled task can alert on it.
     """
@@ -352,6 +373,8 @@ def _status(store: JobStore) -> int:
             oldest = min(pending, key=lambda j: j.created_at)
             minutes = (now - datetime.fromisoformat(oldest.created_at)).total_seconds() / 60
             print(f"oldest {status}: {oldest.job_key} for {minutes:.0f} min")
+    print(latency_summary(store, now))
+    print(_heartbeat_line(cfg, now))
     unresolved = False
     for job in jobs:
         if job.status == QUEUED and job.next_attempt_at:
@@ -432,7 +455,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "retry":
         return _retry(store, args.job_key, args.failed)
     if args.command == "status":
-        return _status(store)
+        return _status(cfg, store)
     if args.command == "hold":
         return _hold(store, audit, args.job_key, args.reason)
     if args.command == "unhold":

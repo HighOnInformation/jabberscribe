@@ -434,3 +434,13 @@ def test_summary_rejection_fails_only_the_primary_of_a_conference(cfg, store, au
 
     assert requeue_failed(store, longest) == longest
     assert (store.get(longest).status, store.get(longest).stage) == (QUEUED, "stt")
+
+
+def test_output_records_the_latency_for_status(cfg, store, audit, make_wav, make_sidecar) -> None:
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+
+    run_once(cfg, store, FakeTranscriber(), FakeSummarizer())
+
+    job = store.get(key)
+    assert job.latency_sec == _result(job)["timings"]["hangup_to_output_sec"]
+    assert job.output_at is not None

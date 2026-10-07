@@ -100,3 +100,14 @@ def test_a_newer_database_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(SchemaError, match="fresh file"):
         JobStore(db).init_schema()
+
+
+def test_upgrade_adds_the_latency_columns(tmp_path: Path) -> None:
+    db = tmp_path / "js.db"
+    _v2_database(db)
+
+    store = JobStore(db)
+    store.init_schema()
+
+    job = store.get("old_1042")
+    assert (job.output_at, job.latency_sec) == (None, None)
