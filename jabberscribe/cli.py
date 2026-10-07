@@ -54,6 +54,24 @@ class Check:
     detail: str
 
 
+def _describe(exc: Exception) -> str:
+    """An HTTP error with the server's own reason, which is what an operator needs to see."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"{exc} {exc.response.text[:200]}"
+    return str(exc)
+
+
+def _read_vocabulary(cfg: Config) -> str | None:
+    try:
+        return load_vocabulary(cfg.stt.vocabulary_file)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"cannot read vocabulary file {cfg.stt.vocabulary_file}: {exc}") from exc
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
 def _check_ffmpeg() -> Check:
     exe = shutil.which("ffmpeg")
     if exe is None:
@@ -77,7 +95,7 @@ def _check_models(cfg: Config, client: httpx.Client) -> Check:
         response.raise_for_status()
         served = {m["id"] for m in response.json()["data"]}
     except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
-        return Check("litellm", False, f"{cfg.litellm.base_url}: {exc}")
+        return Check("litellm", False, f"{cfg.litellm.base_url}: {_describe(exc)}")
     missing = [m for m in (cfg.stt.model, cfg.summary.model) if m not in served]
     if missing:
         return Check("litellm", False, f"{cfg.litellm.base_url} does not serve: {', '.join(missing)}")
@@ -100,7 +118,7 @@ def _check_chat(cfg: Config, client: httpx.Client) -> Check:
         )
         answer = json.loads(strip_fences(response.json()["choices"][0]["message"]["content"]))
     except (httpx.HTTPError, TransientError, ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
-        return Check("litellm.chat", False, f"{cfg.summary.model}: {exc}")
+        return Check("litellm.chat", False, f"{cfg.summary.model}: {_describe(exc)}")
     if answer != {"ok": True}:
         return Check("litellm.chat", False, f"{cfg.summary.model}: unexpected answer {answer!r}")
     return Check("litellm.chat", True, f"{cfg.summary.model}: JSON answer received")
@@ -108,7 +126,10 @@ def _check_chat(cfg: Config, client: httpx.Client) -> Check:
 
 def _check_transcription(cfg: Config, client: httpx.Client) -> Check:
     """A one-second tone must go through the transcription route with our prompt and verbose_json."""
-    prompt = build_prompt(load_vocabulary(cfg.stt.vocabulary_file))
+    try:
+        prompt = build_prompt(_read_vocabulary(cfg))
+    except ConfigError as exc:
+        return Check("litellm.transcription", False, str(exc))
     with tempfile.TemporaryDirectory() as tmp:
         probe = Path(tmp) / "probe.ogg"
         try:
@@ -125,7 +146,7 @@ def _check_transcription(cfg: Config, client: httpx.Client) -> Check:
         except (OSError, subprocess.SubprocessError) as exc:
             return Check("litellm.transcription", False, f"cannot make the probe tone: {exc}")
         except (TransientError, SttError) as exc:
-            return Check("litellm.transcription", False, f"{cfg.stt.model}: {exc}")
+            return Check("litellm.transcription", False, f"{cfg.stt.model}: {_describe(exc)}")
     return Check("litellm.transcription", True, f"{cfg.stt.model}: {len(segments)} segment(s), prompt accepted")
 
 
@@ -133,7 +154,10 @@ def _check_vocabulary(cfg: Config) -> Check:
     path = cfg.stt.vocabulary_file
     if path is None:
         return Check("stt.vocabulary_file", True, "not configured")
-    vocabulary = load_vocabulary(path)
+    try:
+        vocabulary = _read_vocabulary(cfg)
+    except ConfigError as exc:
+        return Check("stt.vocabulary_file", False, str(exc))
     if vocabulary is None:
         return Check("stt.vocabulary_file", False, f"missing or empty: {path}")
     return Check("stt.vocabulary_file", True, f"{path}: {len(vocabulary.split(', '))} terms")
@@ -185,7 +209,7 @@ def _open(cfg: Config) -> tuple[JobStore, AuditLog]:
 
 
 def _workers(cfg: Config, client: httpx.Client) -> tuple[LiteLLMTranscriber, LiteLLMSummarizer]:
-    prompt = build_prompt(load_vocabulary(cfg.stt.vocabulary_file))
+    prompt = build_prompt(_read_vocabulary(cfg))
     summarizer = LiteLLMSummarizer(client, cfg.summary.model, cfg.summary.max_chunk_chars)
     return LiteLLMTranscriber(client, cfg.stt.model, prompt), summarizer
 
@@ -198,6 +222,10 @@ def _process(cfg: Config, store: JobStore, audit: AuditLog, audio: Path, sidecar
         print(f"invalid sidecar {sidecar_path}: {exc}", file=sys.stderr)
         return 1
     if store.get(key) is None:
+        for src in (audio, sidecar_path):
+            if (cfg.paths.inbox / src.name).exists():
+                print(f"inbox already holds {src.name}; refusing to overwrite it", file=sys.stderr)
+                return 2
         shutil.copy2(audio, cfg.paths.inbox / audio.name)
         shutil.copy2(sidecar_path, cfg.paths.inbox / sidecar_path.name)
         # min_age 0: a human handing us one file is not racing a recorder.
@@ -213,10 +241,11 @@ def _process(cfg: Config, store: JobStore, audit: AuditLog, audio: Path, sidecar
         immediate = cfg.model_copy(update={"group": group})
         settle(immediate, store, audit, datetime.now(UTC), conference_id=job.conference_id)
         job = store.get(key)
-    run_job(job.grouped_into or key, cfg, store, *_workers(cfg, make_client(cfg.litellm)))
-    job = store.get(key)
-    print(f"{key}: {job.status} -> {job.out_dir}")
-    return 0 if job.status in (DONE, GROUPED) else 1
+    target_key = job.grouped_into or key
+    run_job(target_key, cfg, store, *_workers(cfg, make_client(cfg.litellm)))
+    target = store.get(target_key)
+    print(f"{key}: {target.status} -> {target.out_dir}")
+    return 0 if target.status == DONE else 1
 
 
 def _report_purge(cfg: Config, store: JobStore, audit: AuditLog) -> int:
@@ -236,18 +265,23 @@ def _serve(cfg: Config, store: JobStore, audit: AuditLog, once: bool) -> int:
         ok = True
         try:
             scan_once(cfg, store, audit)
-            settle(cfg, store, audit, datetime.now(UTC))
+            settle(cfg, store, audit, _utcnow())
             run_once(cfg, store, transcriber, summarizer)
-            today = datetime.now(UTC).date()
-            if last_purge != today:
-                result = purge(cfg, store, audit, now=datetime.now(UTC))
-                for problem in result.errors:
-                    log.error("purge: %s", problem)
-                last_purge = today
         except Exception:
             # One bad poll (a locked file, a full disk, a bug) must not stop the service.
             log.exception("poll failed; continuing")
             ok = False
+        today = _utcnow().date()
+        if last_purge != today:
+            # Marked first: a purge that fails is retried tomorrow, not on every poll.
+            last_purge = today
+            try:
+                result = purge(cfg, store, audit, now=_utcnow())
+                for problem in result.errors:
+                    log.error("purge: %s", problem)
+            except Exception:
+                log.exception("purge failed; next attempt tomorrow")
+                ok = False
         if once:
             return 0 if ok else 1
         time.sleep(cfg.watcher.poll_seconds)
@@ -324,7 +358,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
-        cfg = load_config(args.config)
+        cfg = load_config(args.config.resolve())
     except ConfigError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -337,6 +371,11 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     _ensure_dirs(cfg)
+    try:
+        _read_vocabulary(cfg)
+    except ConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     try:
         store, audit = _open(cfg)
     except SchemaError as exc:

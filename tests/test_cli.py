@@ -382,3 +382,122 @@ def test_status_lists_counts_and_failures(tmp_path, cfg_file, capsys) -> None:
 def test_status_is_zero_when_nothing_failed(cfg_file, capsys) -> None:
     assert main(["--config", str(cfg_file), "status"]) == 0
     assert "queued: 0" in capsys.readouterr().out
+
+
+@needs_ffmpeg
+def test_process_exit_follows_the_primary_of_a_conference_copy(
+    tmp_path, cfg_file, monkeypatch, make_wav, make_sidecar, capsys
+) -> None:
+    def stt_down(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/audio/transcriptions":
+            return httpx.Response(503)
+        return FakeLiteLLM()(request)
+
+    monkeypatch.setattr(cli, "make_client", lambda litellm_cfg: _client(stt_down))
+    first = make_wav(tmp_path / "src" / "a.wav", channels=2)
+    first_side = make_sidecar(tmp_path / "src" / "a.json", call_id="m1", conference_id="conf-1", tracks="dual")
+    second = make_wav(tmp_path / "src" / "b.wav", channels=2)
+    second_side = make_sidecar(
+        tmp_path / "src" / "b.json", call_id="m1", extension="1043", conference_id="conf-1", tracks="dual"
+    )
+
+    assert main(["--config", str(cfg_file), "process", str(first), str(first_side)]) == 1
+    code = main(["--config", str(cfg_file), "process", str(second), str(second_side)])
+
+    store = JobStore(tmp_path / "js.db")
+    copy = store.get("m1_1043")
+    assert copy.grouped_into == "m1_1042"
+    assert store.get("m1_1042").status == QUEUED
+    assert code == 1
+    assert "m1_1043: queued" in capsys.readouterr().out
+
+
+def test_process_refuses_to_overwrite_an_inbox_file(tmp_path, cfg_file, make_wav, make_sidecar, capsys) -> None:
+    make_wav(tmp_path / "drop" / "inbox" / "call.wav")
+    audio = make_wav(tmp_path / "src" / "call.wav")
+    sidecar = make_sidecar(tmp_path / "src" / "call.json")
+
+    assert main(["--config", str(cfg_file), "process", str(audio), str(sidecar)]) == 2
+    assert "refusing to overwrite" in capsys.readouterr().err
+
+
+def test_run_purges_even_when_the_pipeline_raises(cfg_file, fake_litellm, monkeypatch) -> None:
+    purges: list[object] = []
+    monkeypatch.setattr(cli, "run_once", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(cli, "purge", lambda *a, **k: purges.append(k["now"]))
+    monkeypatch.setattr(cli.time, "sleep", _stop_after(3))
+
+    with pytest.raises(_Stop):
+        main(["--config", str(cfg_file), "run"])
+
+    assert len(purges) == 1
+
+
+def test_run_does_not_retry_a_failing_purge_the_same_day(cfg_file, fake_litellm, monkeypatch) -> None:
+    attempts: list[int] = []
+
+    def broken_purge(*args, **kwargs):
+        attempts.append(1)
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(cli, "purge", broken_purge)
+    monkeypatch.setattr(cli.time, "sleep", _stop_after(3))
+
+    with pytest.raises(_Stop):
+        main(["--config", str(cfg_file), "run"])
+
+    assert len(attempts) == 1
+
+
+def test_run_purges_again_on_the_next_utc_day(cfg_file, fake_litellm, monkeypatch) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    clock = {"now": datetime(2026, 10, 7, 23, 59, tzinfo=UTC)}
+    purges: list[object] = []
+    monkeypatch.setattr(cli, "_utcnow", lambda: clock["now"])
+    monkeypatch.setattr(cli, "purge", lambda *a, **k: purges.append(k["now"]))
+    calls = {"n": 0}
+
+    def sleep(seconds: float) -> None:
+        calls["n"] += 1
+        clock["now"] += timedelta(minutes=2)
+        if calls["n"] >= 3:
+            raise _Stop
+
+    monkeypatch.setattr(cli.time, "sleep", sleep)
+
+    with pytest.raises(_Stop):
+        main(["--config", str(cfg_file), "run"])
+
+    assert len(purges) == 2
+
+
+def test_doctor_includes_the_servers_reason_for_a_4xx(cfg) -> None:
+    def reject_chat(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(400, text="System role not supported")
+        return FakeLiteLLM()(request)
+
+    assert "System role not supported" in _checks(cfg, reject_chat)["litellm.chat"].detail
+
+
+def test_doctor_reports_an_unreadable_vocabulary_file(cfg, tmp_path) -> None:
+    vocab = tmp_path / "vocab.txt"
+    vocab.write_bytes(b"\xff\xfe\xfa bad")
+    cfg.stt.vocabulary_file = vocab
+
+    checks = _checks(cfg, FakeLiteLLM())
+
+    assert not checks["stt.vocabulary_file"].ok
+    assert not checks["litellm.transcription"].ok
+
+
+def test_run_exits_2_for_an_unreadable_vocabulary_file(tmp_path, cfg_file, capsys) -> None:
+    vocab = tmp_path / "vocab.txt"
+    vocab.write_bytes(b"\xff\xfe\xfa bad")
+    text = cfg_file.read_text(encoding="utf-8")
+    extra = f"  vocabulary_file: {vocab.as_posix()}"
+    cfg_file.write_text(text.replace("stt:\n", "stt:\n" + extra + "\n"), encoding="utf-8")
+
+    assert main(["--config", str(cfg_file), "run", "--once"]) == 2
+    assert "vocabulary" in capsys.readouterr().err
