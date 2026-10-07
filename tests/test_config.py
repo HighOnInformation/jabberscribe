@@ -125,3 +125,24 @@ def test_near_channel_must_be_zero_or_one(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="near_channel"):
         load_config(_write(tmp_path, data))
+
+
+def test_cues_defaults(tmp_path: Path) -> None:
+    cfg = load_config(_write(tmp_path, BASE))
+
+    assert (cfg.cues.enabled, cfg.cues.model_path, cfg.cues.threshold) == (True, None, 0.3)
+
+
+def test_relative_cues_model_path_is_relative_to_the_config_file(tmp_path: Path) -> None:
+    data = copy.deepcopy(BASE)
+    data["cues"] = {"model_path": "models/cnn14.pth"}
+
+    assert load_config(_write(tmp_path, data)).cues.model_path == tmp_path / "models" / "cnn14.pth"
+
+
+def test_cues_threshold_must_be_a_probability(tmp_path: Path) -> None:
+    data = copy.deepcopy(BASE)
+    data["cues"] = {"threshold": 1.5}
+
+    with pytest.raises(ConfigError, match="threshold"):
+        load_config(_write(tmp_path, data))

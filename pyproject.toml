@@ -11,6 +11,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.6"]
+# The bracket-cue tagger (PANNs on the CPU). Without it the cues stage is skipped.
+cues = ["panns-inference>=0.1.1", "torch>=2.2", "numpy>=1.26"]
 
 [project.scripts]
 jabberscribe = "jabberscribe.cli:main"

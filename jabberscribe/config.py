@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
 class ConfigError(Exception):
@@ -75,6 +75,15 @@ class SummaryConfig(_Strict):
     max_chunk_chars: int = 12000
 
 
+class CuesConfig(_Strict):
+    #: Tag non-speech events ([צחוק], [מוזיקה], ...) into a separate layer. Needs `pip install .[cues]`.
+    enabled: bool = True
+    #: The PANNs Cnn14 checkpoint (Cnn14_mAP=0.431.pth). Relative paths are relative to the config file.
+    model_path: Path | None = None
+    #: A label is cued in a window when one of its AudioSet classes scores at least this.
+    threshold: float = Field(default=0.3, gt=0, lt=1)
+
+
 class RetentionConfig(_Strict):
     audio_days: int = 90
     text_days: int = 365
@@ -88,6 +97,7 @@ class Config(_Strict):
     stt: SttConfig
     summary: SummaryConfig
     retention: RetentionConfig = RetentionConfig()
+    cues: CuesConfig = CuesConfig()
 
 
 def load_config(path: Path) -> Config:
@@ -112,4 +122,7 @@ def load_config(path: Path) -> Config:
     vocabulary = cfg.stt.vocabulary_file
     if vocabulary is not None and not vocabulary.is_absolute():
         cfg.stt.vocabulary_file = path.parent / vocabulary
+    model = cfg.cues.model_path
+    if model is not None and not model.is_absolute():
+        cfg.cues.model_path = path.parent / model
     return cfg
