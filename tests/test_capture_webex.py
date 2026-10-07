@@ -257,9 +257,13 @@ class FakeWebex:
         self.download_status_by_id: dict[str, int] = {}
         self.metadata_extra: dict = {}
         self.redirect_downloads = False
+        self.link_by_id: dict[str, str] = {}
+        self.details_status = 200
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
+        if request.url.scheme not in ("http", "https"):  # what a real transport does
+            raise httpx.UnsupportedProtocol(f"Request URL has an unsupported protocol '{request.url.scheme}://'.")
         path = request.url.path
         if request.url.host == "media.webex.test" and self.redirect_downloads:
             return httpx.Response(302, headers={"Location": f"https://storage.webex.test{path}"})
@@ -273,8 +277,11 @@ class FakeWebex:
             return httpx.Response(204)
         if path.endswith("/metadata"):
             return httpx.Response(200, json={"ownerName": "Owner " + rec_id, **self.metadata_extra})
+        if self.details_status != 200:
+            return httpx.Response(self.details_status, json={})
         item = next(r for r in self.recordings if r["id"] == rec_id)
-        links = {"audioDownloadLink": f"{DOWNLOAD_HOST}/{rec_id}.mp3", "expiration": "2026-10-07T15:00:00Z"}
+        link = self.link_by_id.get(rec_id, f"{DOWNLOAD_HOST}/{rec_id}.mp3")
+        links = {"audioDownloadLink": link, "expiration": "2026-10-07T15:00:00Z"}
         return httpx.Response(200, json={**item, "temporaryDirectDownloadLinks": links})
 
     def calls(self, method: str, fragment: str) -> list[httpx.Request]:
@@ -451,6 +458,31 @@ def test_malformed_recording_is_counted_not_fatal(wcfg: WebexConfig, mp3_bytes) 
     assert Ledger(wcfg.state_path).attempts("rec-bad") == 1
     assert Ledger(wcfg.state_path).attempts("rec-missing") == 1
     assert len(result.exported) == 1
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("bad_link", ["http://x:abc/", "ftp://x"])
+def test_malformed_download_link_is_counted_and_the_next_recording_still_exports(
+    wcfg: WebexConfig, mp3_bytes, bad_link: str
+) -> None:
+    fake = FakeWebex([_recording("rec-bad", "s1"), _recording("rec-ok", "s2")], mp3_bytes(1))
+    fake.link_by_id["rec-bad"] = bad_link
+    result = _exporter(wcfg, fake).run_once()
+    assert result.failed == ("rec-bad",)
+    assert len(result.exported) == 1
+    assert Ledger(wcfg.state_path).attempts("rec-bad") == 1
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_auth_error_on_details_stops_the_poll_without_counting(wcfg: WebexConfig, status: int, caplog) -> None:
+    fake = FakeWebex([_recording("rec-1", "s1"), _recording("rec-2", "s2")], b"")
+    fake.details_status = status
+    with caplog.at_level(logging.ERROR), pytest.raises(httpx.HTTPStatusError):
+        _exporter(wcfg, fake).run_once()
+    assert Ledger(wcfg.state_path).attempts("rec-1") == 0
+    assert Ledger(wcfg.state_path).attempts("rec-2") == 0
+    assert str(status) in caplog.text and "http" not in caplog.text.lower().replace("http " + str(status), "")
+    assert len(fake.calls("GET", "/convergedRecordings/rec-2")) == 0
 
 
 def test_poll_loop_survives_unexpected_errors(caplog) -> None:

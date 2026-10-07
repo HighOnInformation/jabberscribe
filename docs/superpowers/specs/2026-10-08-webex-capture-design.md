@@ -111,6 +111,9 @@ File name base: `jabberscribe.sidecar.job_key(call_id, extension)`.
 | 401/403 on list | Poll aborts with an error log; nothing is written. |
 | 429 / network error | Transient: the poll stops, nothing counts against the recording, next poll retries. `Retry-After` is not honoured beyond the poll interval. |
 | 4xx or 5xx on one recording, empty link, ffprobe/ffmpeg failure, malformed recording (bad time, missing field) | Recording's attempt count increments, the poll continues with the next recording; retried next poll; parked after `max_attempts` (default 5). |
+| 401/403 on details, metadata or download | Token or scope problem, not a recording problem: the poll stops, no attempt is counted, an error naming the status (no URL) is logged. (Metadata 403/404 still degrades to no metadata.) |
+| Malformed or non-http temporary download link (`httpx.InvalidURL`, `UnsupportedProtocol`) | Counted as a per-recording failure like any other; the poll continues. |
+| Sustained Webex 5xx outage longer than `max_attempts` polls | Every affected recording is parked (each poll counts an attempt). Recover by deleting their rows from the exporter's ledger (SQLite file at `state_path`): `DELETE FROM exported WHERE state = 'failed';` (or `... WHERE recording_id = '<id>'`). The next poll retries them if still inside `lookback_hours`. |
 | Unexpected error in a poll | Logged by class name only (no URLs); the daemon keeps polling. |
 | Crash mid-export | Only `.part` files or the work-dir MP3 remain; they are overwritten on retry. The watcher ignores `.part` files and a `.wav` without a `.json`. |
 | Any error before the sidecar rename | No `.json` appears, so the watcher never sees a partial pair; leftover `.wav.part` is removed. |
@@ -153,3 +156,6 @@ model with `extra="forbid"`. The main `jabberscribe/config.py` is untouched.
     decision: retry on later polls, or accept and sweep by retention policy.
 14. `line_owner.extension` when Webex only reports E.164 numbers: is that acceptable as the
     "extension", or must we enrich from the People / Calling user API (more scopes)?
+15. Parked recordings are never retried automatically. Should the exporter unpark or back off
+   (e.g. do not count 5xx outage polls, or retry parked rows after a cool-down) instead of
+   requiring a manual ledger delete?

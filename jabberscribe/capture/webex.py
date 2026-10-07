@@ -511,7 +511,18 @@ class Exporter:
                 continue
             try:
                 key = self._export(item, owners=len(owners.get(_session_id(item), ())))
+            except (httpx.InvalidURL, httpx.UnsupportedProtocol) as exc:
+                # A malformed or non-http temporary link is about this recording, not the network.
+                self._fail(rec_id, exc.__class__.__name__)
+                failed.append(rec_id)
+                continue
             except httpx.HTTPError as exc:
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (401, 403):
+                    # Token or scope problem: every recording would fail, so do not count an attempt.
+                    log.error(
+                        "Webex rejected the token or scope (HTTP %d); stopping the poll", exc.response.status_code
+                    )
+                    raise
                 if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code != 429:
                     # Status only: the exception text carries the URL, and download URLs are credentials.
                     # A 5xx counts as an attempt so one recording that always errors is parked.
