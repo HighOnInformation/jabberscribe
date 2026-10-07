@@ -152,6 +152,16 @@ def test_finish_applies_only_to_a_running_job(tmp_path: Path) -> None:
     assert (store.get("a_1").status, store.get("b_2").status) == (DONE, QUEUED)
 
 
+def test_finish_accepts_only_terminal_statuses(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _create(store)
+    store.claim("c1_1042")
+
+    with pytest.raises(ValueError, match="queued"):
+        store.finish("c1_1042", QUEUED)
+    assert store.get("c1_1042").status == RUNNING
+
+
 def test_retry_later_applies_only_to_a_running_job(tmp_path: Path) -> None:
     store = _store(tmp_path)
     _create(store, "a_1", conference_id="conf-1")

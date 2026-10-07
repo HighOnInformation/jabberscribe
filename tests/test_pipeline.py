@@ -257,6 +257,24 @@ def test_locked_output_file_is_transient(cfg, store, audit, make_wav, make_sidec
     assert store.get(key).status == DONE
 
 
+def test_missing_segments_at_output_is_not_transient(cfg, store, audit, make_wav, make_sidecar) -> None:
+    """Only the output write itself is transient; a lost checkpoint file is a real failure."""
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+
+    class LoseSegments(FakeSummarizer):
+        def summarize(self, segments: list[Segment]) -> Summary | None:
+            (cfg.paths.work_dir / key / pipeline.SEGMENTS_FILE).unlink()
+            return super().summarize(segments)
+
+    _run_at(T0, cfg, store, FakeTranscriber(), LoseSegments())
+    for hour in range(1, MAX_ATTEMPTS):
+        _run_at(T0 + timedelta(hours=hour), cfg, store, FakeTranscriber(), FakeSummarizer())
+
+    job = store.get(key)
+    assert (job.status, job.attempts, job.transient_failures) == (FAILED, MAX_ATTEMPTS, 0)
+    assert job.last_error.startswith("output:")
+
+
 def test_job_handed_over_mid_run_is_not_marked_done(cfg, store, audit, make_wav, make_sidecar) -> None:
     key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
 

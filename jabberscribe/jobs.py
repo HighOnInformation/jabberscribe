@@ -275,6 +275,8 @@ class JobStore:
 
         A job regrouped or reset while the worker held it keeps its new state.
         """
+        if status not in (DONE, FAILED):
+            raise ValueError(f"finish takes {DONE!r} or {FAILED!r}, not {status!r}")
         cur = self._conn.execute(
             "UPDATE jobs SET status = ?, updated_at = ? WHERE job_key = ? AND status = ?",
             (status, utcnow(), job_key, RUNNING),

@@ -17,6 +17,8 @@ behind it.
 
 Status writes at the end of a run apply only while the job is still RUNNING:
 grouping may hand the job over to another copy while the worker holds it.
+complete_stage, record_attempt and record_transient stay unguarded; on a job
+taken away they are harmless, because reset_job clears all three.
 """
 
 from __future__ import annotations
@@ -124,13 +126,17 @@ def process_job(
                 _write_summary(summary_path, summarizer.summarize(_read_segments(segments_path)))
             elif stage == "output":
                 timings["hangup_to_output_sec"] = round((datetime.now(UTC) - _hangup(sidecar)).total_seconds(), 1)
+                # Read the checkpoints first: a missing one is a real failure, not an outage.
+                segments = _read_segments(segments_path)
+                summary = _read_summary(summary_path)
+                owners = owners_for(job, store)
                 try:
                     write_outputs(
                         job.out_dir,
                         sidecar=sidecar,
-                        segments=_read_segments(segments_path),
-                        summary=_read_summary(summary_path),
-                        owners=owners_for(job, store),
+                        segments=segments,
+                        summary=summary,
+                        owners=owners,
                         models={"stt": cfg.stt.model, "summary": cfg.summary.model},
                         recording=job.audio_path,
                         timings=timings,
@@ -178,14 +184,21 @@ def _run(
         if isinstance(exc, TransientError) or attempts < MAX_ATTEMPTS:
             retry_at = clock() + backoff(attempts + failed.transient_failures)
             if store.retry_later(job.job_key, retry_at):
-                log.warning("%s: attempt %d failed, retrying at %s", job.job_key, attempts, retry_at.isoformat())
+                log.warning(
+                    "%s: failed (attempts %d, transient failures %d), retrying at %s",
+                    job.job_key,
+                    attempts,
+                    failed.transient_failures,
+                    retry_at.isoformat(),
+                )
             else:
                 log.warning("%s: failed, but the job changed while it ran; not rescheduled", job.job_key)
-        elif store.finish(job.job_key, FAILED):
-            _delete_stt_audio(cfg.paths.work_dir / job.job_key)
-            log.error("%s: FAILED after %d attempts", job.job_key, attempts)
         else:
-            log.warning("%s: failed for good, but the job changed while it ran; left as it is", job.job_key)
+            _delete_stt_audio(cfg.paths.work_dir / job.job_key)
+            if store.finish(job.job_key, FAILED):
+                log.error("%s: FAILED after %d attempts", job.job_key, attempts)
+            else:
+                log.warning("%s: failed for good, but the job changed while it ran; left as it is", job.job_key)
 
 
 def run_once(
