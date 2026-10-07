@@ -12,12 +12,13 @@ watcher:
   min_age_seconds: 15
 
 # A conference group is the copies of one conference_id whose time spans overlap
-# (within settle_seconds). It is processed once quiet for settle_seconds, or once
-# its first copy has waited max_wait_seconds. A later copy that is longer and ends
-# more than settle_seconds after the processed one replaces it and is reprocessed.
+# (within overlap_slack_seconds). It is processed once quiet for settle_seconds, or
+# once its first copy has waited max_wait_seconds. A later copy that is longer and
+# ends more than settle_seconds after the processed one replaces it and is reprocessed.
 group:
   settle_seconds: 60
   max_wait_seconds: 300
+  overlap_slack_seconds: 5
 
 litellm:
   base_url: http://litellm.corp.local:4000   # without a trailing /v1

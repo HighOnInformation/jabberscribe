@@ -117,12 +117,19 @@ sidecar whose `started_at` is more than one day in the future is quarantined (a 
 would otherwise create a call retention never purges). `line_owner.extension` is trimmed.
 The dedup key is `(call_id, line_owner.extension)`.
 
+`conference_id` SHOULD be unique per conference instance, not per bridge: a recurring or
+back-to-back booking of the same Meet-Me number should get a new `conference_id` each time.
+Grouping only separates reuses whose time spans do not overlap (§6); a recorder that reuses
+the id for overlapping or adjacent meetings merges them.
+
 ## 6. Conference grouping
 
 CUCM forks each participating line separately, so a 10-person conference yields up to
 10 recordings. Recordings that share a `conference_id` **and whose time spans overlap**
-(within `group.settle_seconds`) form one group. A reused `conference_id`, such as a
-recurring Meet-Me number, therefore starts a new group:
+(within `group.overlap_slack_seconds`, default 5s — deliberately not `settle_seconds`) form one
+group. A reused `conference_id`, such as a recurring Meet-Me number or the next booking of the
+same bridge, therefore starts a new group (the recorder SHOULD still supply a `conference_id`
+unique per conference instance, §5):
 
 - Wait until the group is quiet (no new copy for `group.settle_seconds`, default 60s)
   or until its first copy has waited `group.max_wait_seconds` (default 300s).

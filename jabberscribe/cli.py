@@ -28,7 +28,7 @@ from pathlib import Path
 import httpx
 
 from jabberscribe.audit import AuditLog
-from jabberscribe.config import Config, ConfigError, GroupConfig, load_config
+from jabberscribe.config import Config, ConfigError, load_config
 from jabberscribe.group import requeue_failed, settle
 from jabberscribe.jobs import DONE, FAILED, GROUPED, QUEUED, RUNNING, WAITING, JobStore, SchemaError
 from jabberscribe.llm import TransientError, make_client, post
@@ -238,8 +238,7 @@ def _process(cfg: Config, store: JobStore, audit: AuditLog, audio: Path, sidecar
     job = store.get(key)
     if job.status == WAITING:
         # Do not wait for other copies: release this conference now.
-        group = GroupConfig(settle_seconds=cfg.group.settle_seconds, max_wait_seconds=0)
-        immediate = cfg.model_copy(update={"group": group})
+        immediate = cfg.model_copy(update={"group": cfg.group.model_copy(update={"max_wait_seconds": 0})})
         settle(immediate, store, audit, datetime.now(UTC), conference_id=job.conference_id)
         job = store.get(key)
     target_key = job.grouped_into or key

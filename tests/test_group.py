@@ -744,3 +744,36 @@ def test_any_error_in_one_conference_does_not_stop_the_others(
     monkeypatch.setattr(group, "_settle_conference", buggy)
 
     assert _settle(cfg, store, audit).released == (fine,)
+
+
+def test_back_to_back_meetings_on_one_bridge_stay_apart(cfg, store, audit, make_wav, make_sidecar) -> None:
+    """Reviewer probe: Meet-Me 10:00-11:00 done; the next booking starts 11:00:30 on the same id."""
+    first = _drop(
+        cfg, store, audit, make_wav, make_sidecar, "a", "1042",
+        started_at="2026-10-07T10:00:00+03:00", duration_sec=3600,
+    )
+    _release(cfg, store, audit, first)
+    _finish(store, first, owners=[{"extension": "1042"}])
+
+    second = _drop(
+        cfg, store, audit, make_wav, make_sidecar, "b", "3000",
+        started_at="2026-10-07T11:00:30+03:00", duration_sec=4200,
+    )
+    assert _settle(cfg, store, audit) == SettleResult()
+    assert _release(cfg, store, audit, second) == SettleResult(released=(second,))
+
+    assert (store.get(first).status, store.get(first).grouped_into) == (DONE, None)
+    assert (store.get(first).out_dir / TRANSCRIPT_FILE).is_file()
+    assert _owners(store, first) == ["1042"]
+    assert audit.entries(first) == []
+
+
+def test_copies_a_few_seconds_apart_still_group(cfg, store, audit, make_wav, make_sidecar) -> None:
+    early = _drop(
+        cfg, store, audit, make_wav, make_sidecar, "a", "1042", started_at="2026-10-07T10:00:00+03:00", duration_sec=60
+    )
+    late = _drop(
+        cfg, store, audit, make_wav, make_sidecar, "b", "2210", started_at="2026-10-07T10:01:03+03:00", duration_sec=30
+    )
+
+    assert _release(cfg, store, audit, early, late) == SettleResult(released=(early,), attached=(late,))

@@ -69,7 +69,8 @@ A conference produces one output owned by every participating line. If a
 longer copy of the meeting arrives after a shorter one was processed (it ends
 more than `group.settle_seconds` later), the longer copy is transcribed and
 replaces the earlier output (audited as `superseded`). Copies are grouped by
-`conference_id` and overlapping time spans; a copy that bridges several groups
+`conference_id` and overlapping time spans (within `group.overlap_slack_seconds`,
+default 5 s, so back-to-back meetings on one bridge stay apart); a copy that bridges several groups
 merges them, and the longest copy wins.
 
 **Access:** in the MVP the output folder is readable company-wide. This is an

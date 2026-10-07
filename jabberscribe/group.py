@@ -2,9 +2,11 @@
 
 CUCM forks every participating line separately, so a conference arrives as
 several recordings sharing a conference_id. A group is the copies of one
-conference_id whose time spans overlap (within settle_seconds): a reused
-conference_id -- the weekly Meet-Me number -- therefore starts a new group
-instead of joining last week's meeting.
+conference_id whose time spans overlap (within overlap_slack_seconds, a few
+seconds): a reused conference_id -- the weekly Meet-Me number, or the next
+booking of the same bridge -- therefore starts a new group instead of joining
+the earlier meeting. The recorder should still supply a conference_id unique
+per conference instance; the overlap test is the safety net.
 
 New copies wait (status WAITING) until their group goes quiet or has waited
 max_wait_seconds. Then the longest copy is processed and the rest are attached
@@ -244,13 +246,14 @@ def _merge(
 def _settle_conference(
     cfg: Config, store: JobStore, audit: AuditLog, now: datetime, conference_id: str, changes: _Changes
 ) -> None:
+    overlap = timedelta(seconds=cfg.group.overlap_slack_seconds)
     slack = timedelta(seconds=cfg.group.settle_seconds)
     jobs = store.conference_jobs(conference_id)
     primaries = [j for j in jobs if j.status not in (WAITING, GROUPED) and j.grouped_into is None]
     unmatched: list[Job] = []
 
     for copy in sorted((j for j in jobs if j.status == WAITING), key=_rank):
-        overlapping = [p for p in primaries if _overlaps(copy, _span(p, store), slack)]
+        overlapping = [p for p in primaries if _overlaps(copy, _span(p, store), overlap)]
         # A primary that failed for a system reason keeps its group like a live one.
         live = [p for p in overlapping if not _copy_failed(p)]
         failed = [p for p in overlapping if _copy_failed(p)]
@@ -266,7 +269,7 @@ def _settle_conference(
             # A copy that failed on its own recording does not keep its conference: elect the longest of its copies.
             _merge(cfg, store, audit, None, [], [primary], slack, changes)
 
-    for cluster in _clusters(unmatched, slack):
+    for cluster in _clusters(unmatched, overlap):
         arrivals = [datetime.fromisoformat(j.created_at) for j in cluster]
         quiet = (now - max(arrivals)).total_seconds() >= cfg.group.settle_seconds
         overdue = (now - min(arrivals)).total_seconds() >= cfg.group.max_wait_seconds

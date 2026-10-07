@@ -46,6 +46,9 @@ class GroupConfig(_Strict):
     settle_seconds: int = 60
     #: ...or once its first copy has waited this long, to hold the latency budget.
     max_wait_seconds: int = 300
+    #: Copies whose time spans come within this many seconds of each other belong to one meeting.
+    #: Kept small: a reused conference_id booked back to back must not merge two meetings.
+    overlap_slack_seconds: int = 5
 
 
 class LiteLLMConfig(_Strict):

@@ -32,7 +32,7 @@ def test_minimal_config_loads_with_defaults(tmp_path: Path) -> None:
     assert cfg.paths.quarantine == Path("D:/js/drop/quarantine")
     assert cfg.paths.out_root == Path("D:/js/out")
     assert cfg.watcher.min_age_seconds == 15
-    assert (cfg.group.settle_seconds, cfg.group.max_wait_seconds) == (60, 300)
+    assert (cfg.group.settle_seconds, cfg.group.max_wait_seconds, cfg.group.overlap_slack_seconds) == (60, 300, 5)
     assert cfg.litellm.timeout_seconds == 600
     assert cfg.stt.model == "whisper-he"
     assert cfg.stt.vocabulary_file is None
