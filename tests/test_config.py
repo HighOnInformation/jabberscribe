@@ -82,3 +82,21 @@ def test_invalid_yaml(tmp_path: Path) -> None:
 def test_top_level_must_be_mapping(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="mapping"):
         load_config(_write(tmp_path, ["a", "b"]))
+
+
+def test_relative_vocabulary_file_is_relative_to_the_config_file(tmp_path: Path) -> None:
+    data = copy.deepcopy(BASE)
+    data["stt"]["vocabulary_file"] = "custom_vocabulary.txt"
+
+    cfg = load_config(_write(tmp_path, data))
+
+    assert cfg.stt.vocabulary_file == tmp_path / "custom_vocabulary.txt"
+
+
+def test_absolute_vocabulary_file_is_kept(tmp_path: Path) -> None:
+    data = copy.deepcopy(BASE)
+    data["stt"]["vocabulary_file"] = str(tmp_path / "elsewhere" / "vocab.txt")
+
+    cfg = load_config(_write(tmp_path, data))
+
+    assert cfg.stt.vocabulary_file == tmp_path / "elsewhere" / "vocab.txt"

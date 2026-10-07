@@ -56,6 +56,7 @@ class LiteLLMConfig(_Strict):
 class SttConfig(_Strict):
     #: The model_name LiteLLM serves for ivrit.ai Whisper.
     model: str
+    #: A relative path is relative to the config file, not the working directory.
     vocabulary_file: Path | None = None
 
 
@@ -96,6 +97,11 @@ def load_config(path: Path) -> Config:
     if not isinstance(raw, dict):
         raise ConfigError(f"config file must contain a mapping at the top level: {path}")
     try:
-        return Config(**raw)
+        cfg = Config(**raw)
     except ValidationError as exc:
         raise ConfigError(f"invalid config in {path}: {exc}") from exc
+    # A Windows service runs in C:\Windows\System32; resolving against the config file keeps the glossary found.
+    vocabulary = cfg.stt.vocabulary_file
+    if vocabulary is not None and not vocabulary.is_absolute():
+        cfg.stt.vocabulary_file = path.parent / vocabulary
+    return cfg
