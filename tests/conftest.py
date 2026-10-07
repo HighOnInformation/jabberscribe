@@ -72,12 +72,11 @@ def make_wav() -> Callable[..., Path]:
             out.setframerate(rate)
             samples = bytearray()
             for i in range(frames):
-                value = int(12000 * math.sin(2 * math.pi * freq * i / rate))
                 for channel in range(channels):
-                    # Right channel gets an inverted tone so channel-split tests
-                    # can prove the channels did not get swapped or duplicated.
-                    scale = 1 if channel == 0 else -1
-                    samples += struct.pack("<h", value * scale)
+                    # Each channel gets its own pitch (440, 660, ... Hz). An inverted
+                    # copy would cancel to digital silence in a mono downmix.
+                    pitch = freq * (1 + channel / 2)
+                    samples += struct.pack("<h", int(12000 * math.sin(2 * math.pi * pitch * i / rate)))
             out.writeframes(bytes(samples))
         return path
 

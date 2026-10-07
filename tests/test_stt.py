@@ -3,6 +3,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from jabberscribe.llm import TransientError
 from jabberscribe.stt import (
     FILLER_PROMPT,
     LiteLLMTranscriber,
@@ -53,17 +54,24 @@ def test_posts_verbatim_request_and_parses_segments(tmp_path: Path) -> None:
     assert segments == [Segment(0.0, 1.2, "אה, שלום"), Segment(1.5, 3.0, "deploy מחר")]
 
 
-def test_http_error_raises_stt_error(tmp_path: Path) -> None:
-    with pytest.raises(SttError, match="503"):
-        _transcriber(lambda r: httpx.Response(503, text="overloaded")).transcribe(_audio(tmp_path))
+@pytest.mark.parametrize("status", [429, 500, 503])
+def test_overload_and_server_errors_are_transient(tmp_path: Path, status: int) -> None:
+    with pytest.raises(TransientError, match=str(status)):
+        _transcriber(lambda r: httpx.Response(status, text="overloaded")).transcribe(_audio(tmp_path))
 
 
-def test_unreachable_server_raises_stt_error(tmp_path: Path) -> None:
+def test_unreachable_server_is_transient(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("refused")
 
-    with pytest.raises(SttError, match="refused"):
+    with pytest.raises(TransientError, match="refused"):
         _transcriber(handler).transcribe(_audio(tmp_path))
+
+
+@pytest.mark.parametrize("status", [400, 401, 404, 413])
+def test_client_errors_are_permanent(tmp_path: Path, status: int) -> None:
+    with pytest.raises(SttError, match=str(status)):
+        _transcriber(lambda r: httpx.Response(status, text="bad request")).transcribe(_audio(tmp_path))
 
 
 def test_response_without_segments_raises(tmp_path: Path) -> None:
@@ -83,9 +91,46 @@ def test_format_ts() -> None:
     assert format_ts(3725.9) == "01:02:05"
 
 
-def test_build_prompt_appends_vocabulary() -> None:
+def test_build_prompt_puts_the_filler_cue_last() -> None:
+    """Whisper keeps only the last 224 prompt tokens; the filler cue must survive truncation."""
     assert build_prompt(None) == FILLER_PROMPT
-    assert build_prompt("ג'אבר, שלוחה") == f"{FILLER_PROMPT} ג'אבר, שלוחה"
+    assert build_prompt("ג'אבר, שלוחה") == f"ג'אבר, שלוחה {FILLER_PROMPT}"
+
+
+def _segments_response(*segments: dict) -> httpx.Response:
+    return httpx.Response(200, json={"segments": list(segments)})
+
+
+@pytest.mark.parametrize(
+    "quality",
+    [
+        {"compression_ratio": 2.6},
+        {"no_speech_prob": 0.9, "avg_logprob": -1.5},
+    ],
+)
+def test_likely_hallucinations_are_dropped(tmp_path: Path, quality: dict) -> None:
+    bad = {"start": 0.0, "end": 5.0, "text": "תודה רבה תודה רבה תודה רבה", **quality}
+    good = {"start": 5.0, "end": 6.0, "text": "שלום", "compression_ratio": 1.1, "no_speech_prob": 0.1}
+
+    segments = _transcriber(lambda r: _segments_response(bad, good)).transcribe(_audio(tmp_path))
+
+    assert segments == [Segment(5.0, 6.0, "שלום")]
+
+
+def test_quiet_but_confident_speech_is_kept(tmp_path: Path) -> None:
+    soft = {"start": 0.0, "end": 1.0, "text": "כן", "no_speech_prob": 0.9, "avg_logprob": -0.3}
+
+    assert _transcriber(lambda r: _segments_response(soft)).transcribe(_audio(tmp_path)) == [Segment(0.0, 1.0, "כן")]
+
+
+def test_prompt_echo_is_dropped_but_a_lone_filler_is_kept(tmp_path: Path) -> None:
+    echo = {"start": 0.0, "end": 4.0, "text": FILLER_PROMPT}
+    partial_echo = {"start": 4.0, "end": 6.0, "text": "אה, אממ, כאילו..."}
+    filler = {"start": 6.0, "end": 7.0, "text": "אה,"}
+
+    segments = _transcriber(lambda r: _segments_response(echo, partial_echo, filler)).transcribe(_audio(tmp_path))
+
+    assert segments == [Segment(6.0, 7.0, "אה,")]
 
 
 def test_load_vocabulary(tmp_path: Path) -> None:

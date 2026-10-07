@@ -26,7 +26,15 @@ class AudioError(RuntimeError):
 
 def _run_ffmpeg(args: list[str]) -> None:
     try:
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=_TIMEOUT_SECONDS, check=False)
+        # ffmpeg writes UTF-8; the Windows locale code page (cp1255, cp437) cannot decode every message.
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_TIMEOUT_SECONDS,
+            check=False,
+        )
     except FileNotFoundError as exc:
         raise AudioError(f"ffmpeg not found: {exc}") from exc
     except subprocess.TimeoutExpired as exc:
@@ -52,12 +60,17 @@ def prepare_for_stt(src: Path, work_dir: Path, ffmpeg: str = "ffmpeg") -> Path:
     partial = dest.with_suffix(dest.suffix + ".part")
     # -f ogg is required, not cosmetic: the .part suffix defeats ffmpeg's
     # extension-based format detection and it refuses to choose a muxer.
-    _run_ffmpeg(
-        [
-            ffmpeg, "-y", "-nostdin", "-i", str(src),
-            "-af", _LOUDNORM, "-ac", "1", "-ar", str(TARGET_RATE),
-            "-c:a", "libopus", "-b:a", "32k", "-f", "ogg", str(partial),
-        ]
-    )
+    try:
+        _run_ffmpeg(
+            [
+                ffmpeg, "-y", "-nostdin", "-i", str(src),
+                "-af", _LOUDNORM, "-ac", "1", "-ar", str(TARGET_RATE),
+                "-c:a", "libopus", "-b:a", "32k", "-f", "ogg", str(partial),
+            ]
+        )
+    except AudioError:
+        # A half-written Opus file is still the caller's voice; it must not linger.
+        partial.unlink(missing_ok=True)
+        raise
     partial.replace(dest)
     return dest
