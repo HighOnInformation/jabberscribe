@@ -71,11 +71,6 @@ def _read_segments(path: Path) -> list[Segment]:
     return [Segment(**s) for s in json.loads(path.read_text(encoding="utf-8"))]
 
 
-def _write_cues(path: Path, cues: list[Cue] | None) -> None:
-    payload = None if cues is None else [asdict(c) for c in cues]
-    write_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2))
-
-
 def _read_cues(path: Path) -> list[Cue] | None:
     """None when the layer is unavailable -- including a job that passed the cues stage before it existed."""
     if not path.is_file():
@@ -84,16 +79,21 @@ def _read_cues(path: Path) -> list[Cue] | None:
     return None if data is None else [Cue(**c) for c in data]
 
 
-def _tag(tagger: Tagger | None, audio: Path, job_key: str) -> list[Cue] | None:
-    """The recording's cues, or None when there is no tagger or it fails. Cues never fail a job."""
+def _tag(tagger: Tagger | None, audio: Path, job_key: str) -> str:
+    """The cues checkpoint as JSON: the recording's cues, or null when there is no tagger or it fails.
+
+    Cues never fail a job, so the tagger's output is serialised inside the guard: malformed output is a failed tagging.
+    """
     if tagger is None:
         log.info("%s: no tagger; cues skipped", job_key)
-        return None
+        return json.dumps(None)
     try:
-        return tagger.tag(audio)
+        cues = tagger.tag(audio)
+        payload = None if cues is None else [asdict(c) for c in cues]
+        return json.dumps(payload, ensure_ascii=False, indent=2)
     except Exception:
         log.exception("%s: tagging failed; the call goes out without cues", job_key)
-        return None
+        return json.dumps(None)
 
 
 def _summarize(summarizer: Summarizer, segments: list[Segment]) -> tuple[Summary | None, str | None]:
@@ -170,7 +170,7 @@ def process_job(
                 _write_segments(segments_path, transcribe_inputs(transcriber, inputs))
                 _delete_stt_audio(work)
             elif stage == "cues":
-                _write_cues(cues_path, _tag(tagger, job.audio_path, job.job_key))
+                write_atomic(cues_path, _tag(tagger, job.audio_path, job.job_key))
             elif stage == "summarize":
                 _write_summary(summary_path, *_summarize(summarizer, _read_segments(segments_path)))
             elif stage == "output":

@@ -166,3 +166,74 @@ def test_doctor_reports_the_tagger_without_failing(cfg) -> None:
 
     assert check.ok
     assert check.detail == "skipped: no cues.model_path configured"
+
+
+class MalformedTagger:
+    def __init__(self, output) -> None:
+        self.output = output
+
+    def tag(self, audio: Path):
+        return self.output
+
+
+class RefusingTranscriber:
+    def transcribe(self, audio: Path) -> list[Segment]:
+        raise AssertionError("a checkpointed job must not be transcribed again")
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        [{"start": 0.5, "end": 2.0, "label": LAUGHTER}],
+        [Cue(0.5, 2.0, object())],
+        None,
+    ],
+)
+def test_malformed_tagger_output_degrades_to_cues_unavailable(
+    cfg, store, audit, make_wav, make_sidecar, output
+) -> None:
+    key = _checkpointed(cfg, store, audit, make_wav, make_sidecar, "stt")
+
+    run_once(cfg, store, RefusingTranscriber(), FakeSummarizer(), tagger=MalformedTagger(output))
+
+    job = store.get(key)
+    assert (job.status, job.attempts) == (DONE, 0)
+    assert _result(store, key)["cues_available"] is False
+
+
+def _checkpointed(cfg, store, audit, make_wav, make_sidecar, stage: str) -> str:
+    """A job whose stages up to `stage` are done, with its segments checkpoint written."""
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+    work = cfg.paths.work_dir / key
+    work.mkdir(parents=True, exist_ok=True)
+    (work / "segments.json").write_text(
+        json.dumps([{"start": 0.0, "end": 1.5, "text": "אה, שלום"}], ensure_ascii=False), encoding="utf-8"
+    )
+    store.complete_stage(key, stage)
+    return key
+
+
+def test_a_job_checkpointed_at_stt_resumes_into_cues(cfg, store, audit, make_wav, make_sidecar) -> None:
+    key = _checkpointed(cfg, store, audit, make_wav, make_sidecar, "stt")
+    tagger = FakeTagger()
+
+    run_once(cfg, store, RefusingTranscriber(), FakeSummarizer(), tagger=tagger)
+
+    job = store.get(key)
+    assert job.status == DONE
+    assert tagger.seen == [job.audio_path]
+    assert _result(store, key)["cues"] == [{"start": 0.5, "end": 2.0, "label": LAUGHTER}]
+
+
+def test_a_job_past_cues_without_a_cues_checkpoint_goes_out_without_cues(
+    cfg, store, audit, make_wav, make_sidecar
+) -> None:
+    key = _checkpointed(cfg, store, audit, make_wav, make_sidecar, "cues")
+    tagger = FakeTagger()
+
+    run_once(cfg, store, RefusingTranscriber(), FakeSummarizer(), tagger=tagger)
+
+    job = store.get(key)
+    assert job.status == DONE
+    assert tagger.seen == []
+    assert _result(store, key)["cues_available"] is False
