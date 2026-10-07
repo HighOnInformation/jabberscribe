@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from jabberscribe.jobs import (
+    _SCHEMA,
     DONE,
     FAILED,
     GROUPED,
@@ -53,6 +54,7 @@ def test_create_then_get_roundtrip(tmp_path: Path) -> None:
     assert job.conference_id is None
     assert job.grouped_into is None
     assert job.attempts == 0
+    assert job.transient_failures == 0
     assert job.created_at
 
 
@@ -120,6 +122,49 @@ def test_record_attempt_counts_and_keeps_last_error(tmp_path: Path) -> None:
     assert store.record_attempt("c1_1042", "first") == 1
     assert store.record_attempt("c1_1042", "second") == 2
     assert store.get("c1_1042").last_error == "second"
+
+
+def test_record_transient_counts_apart_from_attempts(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _create(store)
+
+    assert store.record_transient("c1_1042", "HTTP 503") == 1
+    assert store.record_transient("c1_1042", "HTTP 502") == 2
+
+    job = store.get("c1_1042")
+    assert (job.attempts, job.transient_failures, job.last_error) == (0, 2, "HTTP 502")
+
+
+def test_record_transient_unknown_key(tmp_path: Path) -> None:
+    with pytest.raises(KeyError):
+        _store(tmp_path).record_transient("nope", "x")
+
+
+def test_finish_applies_only_to_a_running_job(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _create(store, "a_1")
+    _create(store, "b_2")
+    store.claim("a_1")
+
+    assert store.finish("a_1", DONE) is True
+    assert store.finish("b_2", DONE) is False
+
+    assert (store.get("a_1").status, store.get("b_2").status) == (DONE, QUEUED)
+
+
+def test_retry_later_applies_only_to_a_running_job(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _create(store, "a_1", conference_id="conf-1")
+    _create(store, "b_2", conference_id="conf-1")
+    store.set_status("a_1", QUEUED)
+    store.claim("a_1")
+    store.group_into("b_2", "a_1")
+
+    assert store.retry_later("a_1", NOW) is True
+    assert store.retry_later("b_2", NOW) is False
+
+    assert (store.get("a_1").status, store.get("a_1").next_attempt_at) == (QUEUED, "2026-10-07T12:00:00+00:00")
+    assert (store.get("b_2").status, store.get("b_2").next_attempt_at) == (GROUPED, None)
 
 
 def test_record_attempt_unknown_key(tmp_path: Path) -> None:
@@ -228,6 +273,17 @@ def test_requeue_resets_attempts_of_a_failed_primary(tmp_path: Path) -> None:
     assert (job.status, job.attempts, job.next_attempt_at) == (QUEUED, 0, None)
 
 
+def test_requeue_also_resets_transient_failures(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _create(store)
+    store.record_transient("c1_1042", "HTTP 503")
+    store.set_status("c1_1042", FAILED)
+
+    assert store.requeue("c1_1042") is True
+
+    assert store.get("c1_1042").transient_failures == 0
+
+
 def test_requeue_refuses_jobs_that_did_not_fail(tmp_path: Path) -> None:
     store = _store(tmp_path)
     _create(store)
@@ -243,11 +299,13 @@ def test_reset_job_starts_a_copy_from_scratch(tmp_path: Path) -> None:
     store.group_into("b_2", "a_1")
     store.complete_stage("b_2", "output")
     store.record_attempt("b_2", "x")
+    store.record_transient("b_2", "y")
 
     store.reset_job("b_2")
 
     job = store.get("b_2")
     assert (job.status, job.stage, job.grouped_into, job.attempts, job.last_error) == (QUEUED, QUEUED, None, 0, None)
+    assert job.transient_failures == 0
 
 
 def test_hand_over_moves_members_and_demotes_the_old_primary(tmp_path: Path) -> None:
@@ -318,6 +376,21 @@ def test_init_schema_refuses_an_older_database(tmp_path: Path) -> None:
 
     with pytest.raises(SchemaError, match="fresh file"):
         JobStore(tmp_path / "js.db").init_schema()
+
+
+def test_init_schema_adds_transient_failures_to_an_early_v2_database(tmp_path: Path) -> None:
+    early = _SCHEMA.replace("  transient_failures INTEGER NOT NULL DEFAULT 0,\n", "")
+    assert early != _SCHEMA
+    conn = sqlite3.connect(tmp_path / "js.db")
+    conn.executescript(early)
+    conn.execute("PRAGMA user_version = 2")
+    conn.close()
+
+    store = _store(tmp_path)
+    _create(store)
+
+    assert store.record_transient("c1_1042", "HTTP 503") == 1
+    assert store.get("c1_1042").transient_failures == 1
 
 
 def test_init_schema_accepts_its_own_database_again(tmp_path: Path) -> None:

@@ -4,14 +4,19 @@ Stages run in the fixed order audio -> stt -> summarize -> output, and each one
 checkpoints in the job store. A restart resumes at the first incomplete stage,
 so a crash after transcription never transcribes again.
 
-Retry policy. Every failure counts an attempt and schedules the next one with
-exponential backoff (30 s, doubling, capped at 30 min); claim_next skips the
-job until then, so it never blocks the jobs behind it.
+Retry policy. Every failure schedules the next try with exponential backoff
+(30 s, doubling, capped at 30 min, counted over all failures) from the moment
+it failed; claim_next skips the job until then, so it never blocks the jobs
+behind it.
 
-- TransientError (LiteLLM down, overloaded, 5xx): retried forever. An outage
-  delays calls; it must never lose them.
-- Anything else (corrupt audio, a 4xx, a bug): FAILED after MAX_ATTEMPTS, for a
-  human to inspect and `jabberscribe retry`.
+- TransientError (LiteLLM down, overloaded, 5xx, a locked output file): counted
+  in transient_failures and retried forever. An outage delays calls; it must
+  never lose them, nor spend their attempts.
+- Anything else (corrupt audio, a 4xx, a bug): counts an attempt; FAILED after
+  MAX_ATTEMPTS, for a human to inspect and `jabberscribe retry`.
+
+Status writes at the end of a run apply only while the job is still RUNNING:
+grouping may hand the job over to another copy while the worker holds it.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -118,45 +124,68 @@ def process_job(
                 _write_summary(summary_path, summarizer.summarize(_read_segments(segments_path)))
             elif stage == "output":
                 timings["hangup_to_output_sec"] = round((datetime.now(UTC) - _hangup(sidecar)).total_seconds(), 1)
-                write_outputs(
-                    job.out_dir,
-                    sidecar=sidecar,
-                    segments=_read_segments(segments_path),
-                    summary=_read_summary(summary_path),
-                    owners=owners_for(job, store),
-                    models={"stt": cfg.stt.model, "summary": cfg.summary.model},
-                    recording=job.audio_path,
-                    timings=timings,
-                )
+                try:
+                    write_outputs(
+                        job.out_dir,
+                        sidecar=sidecar,
+                        segments=_read_segments(segments_path),
+                        summary=_read_summary(summary_path),
+                        owners=owners_for(job, store),
+                        models={"stt": cfg.stt.model, "summary": cfg.summary.model},
+                        recording=job.audio_path,
+                        timings=timings,
+                    )
+                except OSError as exc:
+                    # A file locked or a share unavailable on the output side is
+                    # not bad data; it clears on its own.
+                    raise TransientError(str(exc)) from exc
             if stage != "output":
                 timings[f"{stage}_sec"] = round(time.monotonic() - began, 1)
                 write_atomic(timings_path, json.dumps(timings))
             store.complete_stage(job.job_key, stage)
     except Exception as exc:
-        store.record_attempt(job.job_key, f"{stage}: {exc}")
+        if isinstance(exc, TransientError):
+            store.record_transient(job.job_key, f"{stage}: {exc}")
+        else:
+            store.record_attempt(job.job_key, f"{stage}: {exc}")
         log.exception("%s: stage %s failed", job.job_key, stage)
         raise
 
-    store.set_status(job.job_key, DONE)
-    log.info("%s: done", job.job_key)
+    if store.finish(job.job_key, DONE):
+        log.info("%s: done", job.job_key)
+    else:
+        log.warning("%s: done, but the job changed while it ran; left as it is", job.job_key)
     return job.out_dir / RESULT_FILE
 
 
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
 def _run(
-    job: Job, cfg: Config, store: JobStore, transcriber: Transcriber, summarizer: Summarizer, now: datetime
+    job: Job,
+    cfg: Config,
+    store: JobStore,
+    transcriber: Transcriber,
+    summarizer: Summarizer,
+    clock: Callable[[], datetime],
 ) -> None:
     try:
         process_job(job, cfg, store, transcriber, summarizer)
     except Exception as exc:
-        attempts = store.get(job.job_key).attempts
+        failed = store.get(job.job_key)
+        attempts = failed.attempts
         if isinstance(exc, TransientError) or attempts < MAX_ATTEMPTS:
-            retry_at = now + backoff(attempts)
-            store.schedule_retry(job.job_key, retry_at)
-            log.warning("%s: attempt %d failed, retrying at %s", job.job_key, attempts, retry_at.isoformat())
-        else:
-            store.set_status(job.job_key, FAILED)
+            retry_at = clock() + backoff(attempts + failed.transient_failures)
+            if store.retry_later(job.job_key, retry_at):
+                log.warning("%s: attempt %d failed, retrying at %s", job.job_key, attempts, retry_at.isoformat())
+            else:
+                log.warning("%s: failed, but the job changed while it ran; not rescheduled", job.job_key)
+        elif store.finish(job.job_key, FAILED):
             _delete_stt_audio(cfg.paths.work_dir / job.job_key)
             log.error("%s: FAILED after %d attempts", job.job_key, attempts)
+        else:
+            log.warning("%s: failed for good, but the job changed while it ran; left as it is", job.job_key)
 
 
 def run_once(
@@ -165,20 +194,32 @@ def run_once(
     transcriber: Transcriber,
     summarizer: Summarizer,
     now: datetime | None = None,
+    clock: Callable[[], datetime] = _utcnow,
 ) -> int:
-    """Process every job that is due once. Returns how many were attempted."""
-    moment = now or datetime.now(UTC)
+    """Process every job that is due once. Returns how many were attempted.
+
+    `now` decides which jobs are due for the whole pass; `clock` times each
+    failure, so a long pass never schedules a retry in the past.
+    """
+    moment = now or clock()
     processed = 0
     while (job := store.claim_next(moment)) is not None:
         processed += 1
-        _run(job, cfg, store, transcriber, summarizer, moment)
+        _run(job, cfg, store, transcriber, summarizer, clock)
     return processed
 
 
-def run_job(job_key: str, cfg: Config, store: JobStore, transcriber: Transcriber, summarizer: Summarizer) -> bool:
+def run_job(
+    job_key: str,
+    cfg: Config,
+    store: JobStore,
+    transcriber: Transcriber,
+    summarizer: Summarizer,
+    clock: Callable[[], datetime] = _utcnow,
+) -> bool:
     """Process one job now, due or not (the `process` command). Returns False if it was not runnable."""
     job = store.claim(job_key)
     if job is None:
         return False
-    _run(job, cfg, store, transcriber, summarizer, datetime.now(UTC))
+    _run(job, cfg, store, transcriber, summarizer, clock)
     return True

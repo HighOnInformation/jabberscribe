@@ -7,7 +7,9 @@ broker and changing nothing else.
 A job is one recorded line's copy of a call, keyed by job_key. Every stage
 checkpoints here, so a crashed worker resumes at the next incomplete stage
 instead of re-transcribing. A job that failed waits in QUEUED until its
-next_attempt_at; claim_next skips it until then.
+next_attempt_at; claim_next skips it until then. `attempts` counts real
+failures only; outages are counted apart in `transient_failures`, so they never
+spend a job's attempt budget.
 """
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   duration_sec    INTEGER NOT NULL,
   grouped_into    TEXT REFERENCES jobs (job_key),
   attempts        INTEGER NOT NULL DEFAULT 0,
+  transient_failures INTEGER NOT NULL DEFAULT 0,
   last_error      TEXT,
   next_attempt_at TEXT,
   created_at      TEXT NOT NULL,
@@ -100,6 +103,7 @@ class Job:
     last_error: str | None
     created_at: str
     next_attempt_at: str | None
+    transient_failures: int
 
 
 def _row_to_job(row: sqlite3.Row) -> Job:
@@ -119,6 +123,7 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         last_error=row["last_error"],
         created_at=row["created_at"],
         next_attempt_at=row["next_attempt_at"],
+        transient_failures=row["transient_failures"],
     )
 
 
@@ -148,6 +153,10 @@ class JobStore:
                 f"database schema version {version} is not {SCHEMA_VERSION}; point paths.db_path at a fresh file"
             )
         self._conn.executescript(_SCHEMA)
+        # A v2 database created before transient_failures existed (pre-release only).
+        columns = {r["name"] for r in self._conn.execute("PRAGMA table_info(jobs)")}
+        if "transient_failures" not in columns:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN transient_failures INTEGER NOT NULL DEFAULT 0")
         self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def create(
@@ -249,6 +258,37 @@ class JobStore:
             raise KeyError(f"unknown job_key: {job_key}")
         return int(row["attempts"])
 
+    def record_transient(self, job_key: str, error: str) -> int:
+        """Count an outage-type failure. It never spends the attempt budget."""
+        cur = self._conn.execute(
+            "UPDATE jobs SET transient_failures = transient_failures + 1, last_error = ?, updated_at = ?"
+            " WHERE job_key = ? RETURNING transient_failures",
+            (error, utcnow(), job_key),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise KeyError(f"unknown job_key: {job_key}")
+        return int(row["transient_failures"])
+
+    def finish(self, job_key: str, status: str) -> bool:
+        """Set a terminal status, but only on a job still RUNNING. Returns whether it applied.
+
+        A job regrouped or reset while the worker held it keeps its new state.
+        """
+        cur = self._conn.execute(
+            "UPDATE jobs SET status = ?, updated_at = ? WHERE job_key = ? AND status = ?",
+            (status, utcnow(), job_key, RUNNING),
+        )
+        return cur.rowcount == 1
+
+    def retry_later(self, job_key: str, at: datetime) -> bool:
+        """schedule_retry, but only on a job still RUNNING. Returns whether it applied."""
+        cur = self._conn.execute(
+            "UPDATE jobs SET status = ?, next_attempt_at = ?, updated_at = ? WHERE job_key = ? AND status = ?",
+            (QUEUED, iso(at), utcnow(), job_key, RUNNING),
+        )
+        return cur.rowcount == 1
+
     def schedule_retry(self, job_key: str, at: datetime) -> None:
         """Put a failed job back in the queue, not to be claimed before `at`."""
         self._conn.execute(
@@ -263,7 +303,7 @@ class JobStore:
         is not requeued: its conference already has a primary.
         """
         cur = self._conn.execute(
-            "UPDATE jobs SET status = ?, attempts = 0, next_attempt_at = NULL, updated_at = ?"
+            "UPDATE jobs SET status = ?, attempts = 0, transient_failures = 0, next_attempt_at = NULL, updated_at = ?"
             " WHERE job_key = ? AND status = ? AND grouped_into IS NULL",
             (QUEUED, utcnow(), job_key, FAILED),
         )
@@ -272,8 +312,8 @@ class JobStore:
     def reset_job(self, job_key: str) -> None:
         """Make a conference copy the primary from scratch: QUEUED, no stage done, no attempts."""
         self._conn.execute(
-            "UPDATE jobs SET status = ?, stage = ?, grouped_into = NULL, attempts = 0, last_error = NULL,"
-            " next_attempt_at = NULL, updated_at = ? WHERE job_key = ?",
+            "UPDATE jobs SET status = ?, stage = ?, grouped_into = NULL, attempts = 0, transient_failures = 0,"
+            " last_error = NULL, next_attempt_at = NULL, updated_at = ? WHERE job_key = ?",
             (QUEUED, QUEUED, utcnow(), job_key),
         )
 

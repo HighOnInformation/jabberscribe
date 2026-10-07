@@ -5,8 +5,9 @@ from pathlib import Path
 
 import pytest
 
+from jabberscribe import pipeline
 from jabberscribe.audio import STT_FILENAME
-from jabberscribe.jobs import DONE, FAILED, QUEUED
+from jabberscribe.jobs import DONE, FAILED, GROUPED, QUEUED
 from jabberscribe.llm import TransientError
 from jabberscribe.output import ACTIONS_FILE, RESULT_FILE, SUMMARY_FILE, TRANSCRIPT_FILE
 from jabberscribe.pipeline import MAX_ATTEMPTS, backoff, run_job, run_once
@@ -59,6 +60,11 @@ def _enqueue(cfg, store, audit, make_wav, make_sidecar, *, call_id="abc", extens
     )
     scan_once(cfg, store, audit, min_age_seconds=0)
     return f"{call_id}_{extension}"
+
+
+def _run_at(moment: datetime, cfg, store, transcriber, summarizer) -> int:
+    """One pass at `moment` whose failures also happen at `moment`."""
+    return run_once(cfg, store, transcriber, summarizer, now=moment, clock=lambda: moment)
 
 
 def _result(job) -> dict:
@@ -121,25 +127,57 @@ def test_unavailable_summary_still_completes(cfg, store, audit, make_wav, make_s
 def test_resume_after_crash_does_not_retranscribe(cfg, store, audit, make_wav, make_sidecar) -> None:
     key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
 
-    run_once(cfg, store, FakeTranscriber(), ExplodingSummarizer(), now=T0)
+    _run_at(T0, cfg, store, FakeTranscriber(), ExplodingSummarizer())
     crashed = store.get(key)
     assert (crashed.status, crashed.stage, crashed.attempts) == (QUEUED, "stt", 1)
     assert "summarize: summarizer bug" in crashed.last_error
 
     transcriber = FakeTranscriber()
-    run_once(cfg, store, transcriber, FakeSummarizer(), now=T0 + timedelta(minutes=1))
+    _run_at(T0 + timedelta(minutes=1), cfg, store, transcriber, FakeSummarizer())
 
     assert store.get(key).status == DONE
     assert transcriber.calls == []
 
 
+def test_transient_summary_outage_resumes_at_summarize(cfg, store, audit, make_wav, make_sidecar) -> None:
+    """I9: a summary outage retries the summary; it never re-transcribes or drops it."""
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+
+    class DownSummarizer:
+        def summarize(self, segments: list[Segment]) -> Summary | None:
+            raise TransientError("HTTP 503")
+
+    _run_at(T0, cfg, store, FakeTranscriber(), DownSummarizer())
+    waiting = store.get(key)
+    assert (waiting.status, waiting.stage, waiting.attempts, waiting.transient_failures) == (QUEUED, "stt", 0, 1)
+
+    transcriber = FakeTranscriber()
+    _run_at(T0 + timedelta(minutes=1), cfg, store, transcriber, FakeSummarizer())
+
+    job = store.get(key)
+    assert job.status == DONE
+    assert _result(job)["summary"] == SUMMARY.text
+    assert transcriber.calls == []
+
+
 def test_failed_job_waits_for_its_backoff(cfg, store, audit, make_wav, make_sidecar) -> None:
     key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
-    run_once(cfg, store, FailingTranscriber(SttError("bad audio")), FakeSummarizer(), now=T0)
+    _run_at(T0, cfg, store, FailingTranscriber(SttError("bad audio")), FakeSummarizer())
 
     assert store.get(key).next_attempt_at == "2026-10-07T12:00:30+00:00"
-    assert run_once(cfg, store, FakeTranscriber(), FakeSummarizer(), now=T0 + timedelta(seconds=29)) == 0
-    assert run_once(cfg, store, FakeTranscriber(), FakeSummarizer(), now=T0 + timedelta(seconds=30)) == 1
+    assert _run_at(T0 + timedelta(seconds=29), cfg, store, FakeTranscriber(), FakeSummarizer()) == 0
+    assert _run_at(T0 + timedelta(seconds=30), cfg, store, FakeTranscriber(), FakeSummarizer()) == 1
+
+
+def test_backoff_counts_from_the_failure_not_the_pass_start(cfg, store, audit, make_wav, make_sidecar) -> None:
+    """A pass slower than the backoff must not leave the job due at once."""
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+    failed_at = T0 + timedelta(minutes=5)
+
+    run_once(cfg, store, FailingTranscriber(SttError("bad audio")), FakeSummarizer(), now=T0, clock=lambda: failed_at)
+
+    assert store.get(key).next_attempt_at == "2026-10-07T12:05:30+00:00"
+    assert _run_at(failed_at, cfg, store, FakeTranscriber(), FakeSummarizer()) == 0
 
 
 def test_permanent_failure_gives_up_and_deletes_the_stt_copy(cfg, store, audit, make_wav, make_sidecar) -> None:
@@ -148,7 +186,7 @@ def test_permanent_failure_gives_up_and_deletes_the_stt_copy(cfg, store, audit, 
 
     for hour in range(MAX_ATTEMPTS):
         assert store.get(key).status == QUEUED
-        run_once(cfg, store, transcriber, FakeSummarizer(), now=T0 + timedelta(hours=hour))
+        _run_at(T0 + timedelta(hours=hour), cfg, store, transcriber, FakeSummarizer())
         if hour == 0:
             assert (cfg.paths.work_dir / key / STT_FILENAME).is_file()
 
@@ -164,12 +202,87 @@ def test_transient_failure_never_fails_the_job(cfg, store, audit, make_wav, make
     transcriber = FailingTranscriber(TransientError("HTTP 503"))
 
     for hour in range(10):
-        run_once(cfg, store, transcriber, FakeSummarizer(), now=T0 + timedelta(hours=hour))
+        _run_at(T0 + timedelta(hours=hour), cfg, store, transcriber, FakeSummarizer())
 
     job = store.get(key)
-    assert (job.status, job.attempts) == (QUEUED, 10)
-    run_once(cfg, store, FakeTranscriber(), FakeSummarizer(), now=T0 + timedelta(hours=10))
+    assert (job.status, job.attempts, job.transient_failures) == (QUEUED, 0, 10)
+    _run_at(T0 + timedelta(hours=10), cfg, store, FakeTranscriber(), FakeSummarizer())
     assert store.get(key).status == DONE
+
+
+def test_an_outage_does_not_spend_the_attempt_budget(cfg, store, audit, make_wav, make_sidecar) -> None:
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+    down = FailingTranscriber(TransientError("HTTP 503"))
+    broken = FailingTranscriber(SttError("bad audio"))
+    for hour in range(10):
+        _run_at(T0 + timedelta(hours=hour), cfg, store, down, FakeSummarizer())
+
+    _run_at(T0 + timedelta(hours=10), cfg, store, broken, FakeSummarizer())
+    job = store.get(key)
+    assert (job.status, job.attempts) == (QUEUED, 1)
+
+    for hour in (11, 12):
+        _run_at(T0 + timedelta(hours=hour), cfg, store, broken, FakeSummarizer())
+    assert store.get(key).status == FAILED
+
+
+def test_backoff_grows_with_transient_failures_too(cfg, store, audit, make_wav, make_sidecar) -> None:
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+    down = FailingTranscriber(TransientError("HTTP 503"))
+    for hour in range(3):
+        _run_at(T0 + timedelta(hours=hour), cfg, store, down, FakeSummarizer())
+
+    assert store.get(key).next_attempt_at == "2026-10-07T14:02:00+00:00"
+
+
+def test_locked_output_file_is_transient(cfg, store, audit, make_wav, make_sidecar, monkeypatch) -> None:
+    """A recording held open on the share locks the file; that is not bad data."""
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+    real_write_outputs = pipeline.write_outputs
+    locked = {"left": 5}
+
+    def flaky_write_outputs(*args, **kwargs):
+        if locked["left"]:
+            locked["left"] -= 1
+            raise PermissionError(13, "The process cannot access the file")
+        return real_write_outputs(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "write_outputs", flaky_write_outputs)
+    for hour in range(5):
+        _run_at(T0 + timedelta(hours=hour), cfg, store, FakeTranscriber(), FakeSummarizer())
+
+    job = store.get(key)
+    assert (job.status, job.attempts, job.transient_failures) == (QUEUED, 0, 5)
+    _run_at(T0 + timedelta(hours=5), cfg, store, FakeTranscriber(), FakeSummarizer())
+    assert store.get(key).status == DONE
+
+
+def test_job_handed_over_mid_run_is_not_marked_done(cfg, store, audit, make_wav, make_sidecar) -> None:
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+
+    class HandOverDuringStt(FakeTranscriber):
+        def transcribe(self, audio: Path) -> list[Segment]:
+            store.set_status(key, GROUPED)
+            return super().transcribe(audio)
+
+    _run_at(T0, cfg, store, HandOverDuringStt(), FakeSummarizer())
+
+    assert store.get(key).status == GROUPED
+
+
+def test_job_handed_over_mid_run_is_not_requeued_or_failed(cfg, store, audit, make_wav, make_sidecar) -> None:
+    key = _enqueue(cfg, store, audit, make_wav, make_sidecar)
+
+    class HandOverThenFail:
+        def transcribe(self, audio: Path) -> list[Segment]:
+            store.set_status(key, GROUPED)
+            raise SttError("bad audio")
+
+    for hour in range(MAX_ATTEMPTS):
+        store.set_status(key, QUEUED)
+        _run_at(T0 + timedelta(hours=hour), cfg, store, HandOverThenFail(), FakeSummarizer())
+        job = store.get(key)
+        assert (job.status, job.next_attempt_at) == (GROUPED, None)
 
 
 def test_a_failing_job_does_not_block_the_queue(cfg, store, audit, make_wav, make_sidecar) -> None:
@@ -182,7 +295,18 @@ def test_a_failing_job_does_not_block_the_queue(cfg, store, audit, make_wav, mak
                 raise SttError("poisoned")
             return super().transcribe(audio)
 
-    assert run_once(cfg, store, FailFirst(), FakeSummarizer(), now=T0) == 2
+    assert _run_at(T0, cfg, store, FailFirst(), FakeSummarizer()) == 2
+    assert store.get(first).status == QUEUED
+    assert store.get(second).status == DONE
+
+
+def test_a_job_not_yet_due_does_not_block_a_due_one(cfg, store, audit, make_wav, make_sidecar) -> None:
+    first = _enqueue(cfg, store, audit, make_wav, make_sidecar, call_id="aaa")
+    second = _enqueue(cfg, store, audit, make_wav, make_sidecar, call_id="bbb")
+    store.schedule_retry(first, T0 + timedelta(hours=1))
+
+    assert _run_at(T0, cfg, store, FakeTranscriber(), FakeSummarizer()) == 1
+
     assert store.get(first).status == QUEUED
     assert store.get(second).status == DONE
 
@@ -196,7 +320,7 @@ def test_unreadable_sidecar_counts_as_an_attempt(cfg, store, audit, make_wav, ma
     store.scrub_sidecar(key)
 
     for hour in range(MAX_ATTEMPTS):
-        run_once(cfg, store, FakeTranscriber(), FakeSummarizer(), now=T0 + timedelta(hours=hour))
+        _run_at(T0 + timedelta(hours=hour), cfg, store, FakeTranscriber(), FakeSummarizer())
 
     assert store.get(key).status == FAILED
 
