@@ -565,3 +565,100 @@ def test_merge_retries_after_owner_update_fails_without_auditing_twice(
     assert _settle(cfg, store, audit) == SettleResult(attached=(bridge,), superseded=(second,))
     assert _owners(store, first) == ["1042", "2210", "3000"]
     assert [e.action for e in audit.entries(second)].count(SUPERSEDED) == 1
+
+
+def _failed_with_member(cfg, store, audit, make_wav, make_sidecar, *, member_sec: int) -> tuple[str, str]:
+    """A 60-minute copy from 14:30 that failed, with a shorter copy of the same group attached."""
+    failed = _drop(
+        cfg,
+        store,
+        audit,
+        make_wav,
+        make_sidecar,
+        "f",
+        "4000",
+        started_at="2026-10-07T14:30:00+03:00",
+        duration_sec=3600,
+    )
+    member = _drop(
+        cfg,
+        store,
+        audit,
+        make_wav,
+        make_sidecar,
+        "m",
+        "5000",
+        started_at="2026-10-07T14:31:00+03:00",
+        duration_sec=member_sec,
+    )
+    _release(cfg, store, audit, failed, member)
+    store.set_status(failed, FAILED)
+    return failed, member
+
+
+def test_longer_member_of_a_failed_primary_beats_a_short_bridging_copy(cfg, store, audit, make_wav, make_sidecar):
+    leaver = _drop(
+        cfg, store, audit, make_wav, make_sidecar, "a", "1042", started_at="2026-10-07T14:00:00+03:00", duration_sec=480
+    )
+    _release(cfg, store, audit, leaver)
+    _finish(store, leaver)
+    failed, member = _failed_with_member(cfg, store, audit, make_wav, make_sidecar, member_sec=3300)
+    bridge = _drop(
+        cfg,
+        store,
+        audit,
+        make_wav,
+        make_sidecar,
+        "c",
+        "3000",
+        started_at="2026-10-07T14:05:00+03:00",
+        duration_sec=1800,
+    )
+
+    result = _settle(cfg, store, audit)
+
+    assert result.released == (member,)
+    assert sorted(result.superseded) == sorted([leaver, failed])
+    assert result.attached == (bridge,)
+    assert (store.get(member).status, store.get(member).grouped_into) == (QUEUED, None)
+    assert store.get(bridge).grouped_into == member
+    assert (store.get(leaver).status, store.get(leaver).grouped_into) == (GROUPED, member)
+    assert (store.get(failed).status, store.get(failed).grouped_into) == (FAILED, member)
+    assert {o.extension for o in owners_for(store.get(member), store)} == {"5000", "1042", "4000", "3000"}
+    assert _settle(cfg, store, audit) == SettleResult()
+
+
+def test_live_primary_beats_a_shorter_member_of_a_failed_primary(cfg, store, audit, make_wav, make_sidecar) -> None:
+    primary = _drop(
+        cfg,
+        store,
+        audit,
+        make_wav,
+        make_sidecar,
+        "a",
+        "1042",
+        started_at="2026-10-07T13:20:00+03:00",
+        duration_sec=3000,
+    )
+    _release(cfg, store, audit, primary)
+    _finish(store, primary, owners=[{"extension": "1042"}])
+    failed, member = _failed_with_member(cfg, store, audit, make_wav, make_sidecar, member_sec=600)
+    bridge = _drop(
+        cfg,
+        store,
+        audit,
+        make_wav,
+        make_sidecar,
+        "c",
+        "3000",
+        started_at="2026-10-07T14:05:00+03:00",
+        duration_sec=1800,
+    )
+
+    result = _settle(cfg, store, audit)
+
+    assert result == SettleResult(attached=(bridge,), superseded=(failed,))
+    assert store.get(primary).status == DONE
+    assert (store.get(failed).status, store.get(failed).grouped_into) == (FAILED, primary)
+    assert (store.get(member).status, store.get(member).grouped_into) == (GROUPED, primary)
+    assert _owners(store, primary) == ["1042", "4000", "5000", "3000"]
