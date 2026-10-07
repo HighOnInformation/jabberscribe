@@ -83,14 +83,14 @@ def _unique_target(directory: Path, name: str) -> Path:
 def quarantine_pair(paths: list[Path], quarantine_dir: Path, reason: str, audit: AuditLog) -> None:
     quarantine_dir.mkdir(parents=True, exist_ok=True)
     stem = paths[0].stem
-    moved: list[str] = []
-    for path in paths:
-        if path.exists():
-            target = _unique_target(quarantine_dir, path.name)
-            shutil.move(str(path), str(target))
-            moved.append(target.name)
+    present = [path for path in paths if path.exists()]
+    # Evidence first: if a move below fails, the reason and audit row still exist.
     _unique_target(quarantine_dir, f"{stem}.reason.txt").write_text(reason, encoding="utf-8")
-    audit.record(stem, QUARANTINED, f"{', '.join(moved)}: {reason}")
+    audit.record(stem, QUARANTINED, f"{', '.join(path.name for path in present)}: {reason}")
+    # Sidecar (last in `paths`) moves first: a lone audio file in the inbox is
+    # invisible to find_ready_pairs, whereas a lone sidecar would be skipped forever.
+    for path in reversed(present):
+        shutil.move(str(path), str(_unique_target(quarantine_dir, path.name)))
     log.warning("quarantined %s: %s", stem, reason)
 
 
@@ -117,9 +117,9 @@ def _ingest(cfg: Config, store: JobStore, audit: AuditLog, audio: Path, sidecar:
     if store.get(sidecar.job_key) is not None:
         # Already known. Drop the duplicate rather than reprocess it.
         log.info("duplicate %s, discarding inbox copy", sidecar.job_key)
+        audit.record(sidecar.job_key, DISCARDED_DUPLICATE, f"{audio.name}, {sidecar_path.name}")
         audio.unlink(missing_ok=True)
         sidecar_path.unlink(missing_ok=True)
-        audit.record(sidecar.job_key, DISCARDED_DUPLICATE, f"{audio.name}, {sidecar_path.name}")
         return False
 
     out_dir = out_dir_for(cfg.paths.out_root, sidecar)
@@ -178,7 +178,7 @@ def scan_once(cfg: Config, store: JobStore, audit: AuditLog, min_age_seconds: in
                 skipped.append(sidecar.job_key)
         except OSError as exc:
             # A locked file (AV scanner, indexer) or a bad ACL: leave the pair and move on.
-            log.error("cannot ingest %s, will retry next scan: %s", sidecar_path.stem, exc)
+            log.error("cannot ingest %s, will retry next scan: %s", sidecar_path.stem, exc, exc_info=True)
             deferred.append(sidecar_path.stem)
 
     return ScanResult(tuple(enqueued), tuple(quarantined), tuple(skipped), tuple(deferred))

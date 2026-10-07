@@ -1,4 +1,8 @@
 import shutil
+import sqlite3
+from pathlib import Path
+
+import pytest
 
 from jabberscribe.audit import DISCARDED_DUPLICATE, QUARANTINED
 from jabberscribe.jobs import QUEUED, WAITING
@@ -219,6 +223,103 @@ def test_no_partial_recording_is_left(cfg, store, audit, make_wav, make_sidecar,
     scan_once(cfg, store, audit)
 
     assert list(cfg.paths.out_root.rglob("*.part")) == []
+
+
+def test_quarantine_audits_before_moving_and_moves_sidecar_first(cfg, store, audit, make_wav, monkeypatch) -> None:
+    make_wav(cfg.paths.inbox / "bad.wav")
+    (cfg.paths.inbox / "bad.json").write_text("{not json", encoding="utf-8")
+    real_move = shutil.move
+    calls = []
+
+    def move_once_then_fail(src, dst, *args, **kwargs):
+        calls.append(src)
+        if len(calls) == 2:
+            raise PermissionError("held by antivirus")
+        return real_move(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr("jabberscribe.watcher.shutil.move", move_once_then_fail)
+
+    result = scan_once(cfg, store, audit)
+
+    assert result.deferred == ("bad",)
+    assert result.quarantined == ()
+    # The evidence trail exists even though the pair is split.
+    assert "JSON" in (cfg.paths.quarantine / "bad.reason.txt").read_text(encoding="utf-8")
+    assert [e.action for e in audit.entries("bad")] == [QUARANTINED]
+    # Sidecar went first; the lone audio stays in the inbox, invisible to the next scan.
+    assert (cfg.paths.quarantine / "bad.json").is_file()
+    assert (cfg.paths.inbox / "bad.wav").is_file()
+    assert not (cfg.paths.quarantine / "bad.wav").exists()
+    assert not (cfg.paths.inbox / "bad.json").exists()
+    assert find_ready_pairs(cfg.paths.inbox, 0) == []
+
+
+def test_duplicate_discard_is_audited_before_the_unlinks(
+    cfg, store, audit, make_wav, make_sidecar, monkeypatch
+) -> None:
+    make_wav(cfg.paths.inbox / "a.wav")
+    make_sidecar(cfg.paths.inbox / "a.json", call_id="dup")
+    scan_once(cfg, store, audit)
+    make_wav(cfg.paths.inbox / "b.wav")
+    make_sidecar(cfg.paths.inbox / "b.json", call_id="dup")
+    real_unlink = Path.unlink
+
+    def unlink_unless_sidecar(self, *args, **kwargs):
+        if self.name == "b.json":
+            raise PermissionError("locked")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink_unless_sidecar)
+
+    result = scan_once(cfg, store, audit)
+
+    assert result.deferred == ("b",)
+    assert [e.action for e in audit.entries("dup_1042")] == [DISCARDED_DUPLICATE]
+
+
+def test_failed_create_leaves_the_inbox_pair_in_place(cfg, store, audit, make_wav, make_sidecar, monkeypatch) -> None:
+    make_wav(cfg.paths.inbox / "a.wav")
+    make_sidecar(cfg.paths.inbox / "a.json", call_id="abc")
+
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "create", locked)
+
+    with pytest.raises(sqlite3.OperationalError):
+        scan_once(cfg, store, audit)
+
+    assert (cfg.paths.inbox / "a.wav").is_file()
+    assert (cfg.paths.inbox / "a.json").is_file()
+    assert store.list_all() == []
+
+
+def test_inbox_unlink_failure_after_create_becomes_an_audited_duplicate(
+    cfg, store, audit, make_wav, make_sidecar, monkeypatch
+) -> None:
+    make_wav(cfg.paths.inbox / "a.wav")
+    make_sidecar(cfg.paths.inbox / "a.json", call_id="abc")
+    real_unlink = Path.unlink
+
+    def unlink_unless_inbox(self, *args, **kwargs):
+        if self.parent == cfg.paths.inbox:
+            raise PermissionError("locked")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink_unless_inbox)
+
+    assert scan_once(cfg, store, audit).deferred == ("a",)
+    job = store.get("abc_1042")
+    assert job is not None
+    assert (cfg.paths.inbox / "a.wav").is_file()
+
+    monkeypatch.undo()
+    result = scan_once(cfg, store, audit)
+
+    assert result.skipped == ("abc_1042",)
+    assert [e.action for e in audit.entries("abc_1042")] == [DISCARDED_DUPLICATE]
+    assert job.audio_path.is_file()
+    assert not (cfg.paths.inbox / "a.wav").exists()
 
 
 def _raise_disk_full(*args, **kwargs):
