@@ -10,7 +10,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-stt = ["faster-whisper>=1.2"]
 dev = ["pytest>=8.0", "ruff>=0.6"]
 
 [project.scripts]
@@ -32,5 +31,5 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "slow: requires the STT model to be downloaded",
+    "slow: talks to the real LiteLLM server (needs JABBERSCRIBE_LIVE_CONFIG and JABBERSCRIBE_LIVE_CLIP)",
 ]
